@@ -4,6 +4,8 @@ const { ChocoNode } = require('./node');
 
 const args = process.argv.slice(2);
 
+// notes for future, we should remake this, bc it looks bad
+
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`
   ChocoNode — PoC Testnet Node
