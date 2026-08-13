@@ -83,7 +83,7 @@ class Chain {
     return {
       altura: this.altura, hash: this.melhorHash, blocos: totalBlocks,
       usuarios: wallets, total_txs: totalTxs, mempool: mempoolCount,
-      plots_count: plotsCount, capacidade_gb: Number(capacityGb.toFixed(2)), // capacityGb is now guaranteed numeric
+      plots_count: plotsCount, capacidade_gb: Number(capacityGb.toFixed(2)),
       chain_work: (tip && tip.chain_work) || '0',
       supply: String(supply), max_deadline: this.computeMaxDeadline(),
       base_target: (tip && tip.base_target) || String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
@@ -441,9 +441,6 @@ class Chain {
     this._selectTip();
     this._purgeOrphanedDescendants(forkPoint.height, target.height);
     this._recomputeBalances();
-    // _purgeOrphanedBlocks was previously defined but never invoked anywhere, so stale
-    // side-chain blocks left behind by reorgs accumulated in the DB indefinitely. Run it
-    // here as a final sweep now that the new tip is selected and balances are correct.
     this._purgeOrphanedBlocks();
     log('info', `Reorg to #${this.altura} ${this.melhorHash.slice(0, 10)} (depth ${depth})`);
     return { ok: true, motivo: 'reorganized', height: this.altura, hash: this.melhorHash };
