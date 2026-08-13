@@ -266,8 +266,7 @@ function hashTransaction(tx) {
 function hashBlock(bloco) {
   let rewardsStr = '';
   if (Array.isArray(bloco.rewards)) {
-    // Normalize key order per reward entry so equivalent reward sets always hash the same,
-    // regardless of the property insertion order used by the caller.
+    // normalize key, got problem with it some times :/
     const normalized = bloco.rewards.map(r => {
       const n = {};
       for (const k of Object.keys(r).sort()) n[k] = r[k];
