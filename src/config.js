@@ -4,7 +4,6 @@ const { URL } = require('url');
 
 const BASE_DIR = __dirname + '/..';
 
-// Load config.env if present
 try {
   const envPath = path.join(BASE_DIR, 'config.env');
   if (fs.existsSync(envPath)) {
