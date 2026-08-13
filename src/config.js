@@ -3,7 +3,7 @@ const path = require('path');
 const { URL } = require('url');
 
 const BASE_DIR = __dirname + '/..';
-
+// load env
 try {
   const envPath = path.join(BASE_DIR, 'config.env');
   if (fs.existsSync(envPath)) {
