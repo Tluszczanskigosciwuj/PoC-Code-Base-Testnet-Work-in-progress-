@@ -125,9 +125,6 @@ function initDB(dbPath, cfg) {
     }
   } catch (e) { /* migration may have already run */ }
 
-  // Must match the standard address format produced by pubkeyToAddress: '0xcc' + 40 hex chars (44 total).
-  // The previous literal ('0xccc' + 43 zeros = 45 chars) didn't match that shape and could fail
-  // any address-format validation (regex length checks, etc.) applied elsewhere in the codebase.
   const treasuryAddress = '0xcc' + '0'.repeat(40);
   const treasuryAmount = safeBigInt(cfg.maxSupply || '21000000000000000000000000', 0n);
   const existing = db.prepare('SELECT balance FROM users WHERE address = ?').get(treasuryAddress);
