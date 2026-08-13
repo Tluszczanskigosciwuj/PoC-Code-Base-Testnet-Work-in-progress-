@@ -1,0 +1,24 @@
+{
+  "name": "choconode",
+  "version": "3.6.0",
+  "private": true,
+  "bin": {
+    "choco": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/",
+    "cli": "node cli.js",
+    "wallet": "node wallet.js",
+    "wallet-py": "python wallet.py",
+    "gui": "python wallet_gui.py",
+    "testnet": "node testnet/alpha-testnet.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "express": "^5.2.1",
+    "helmet": "^8.2.0",
+    "localtunnel": "^2.0.2",
+    "ws": "^8.21.0"
+  }
+}
