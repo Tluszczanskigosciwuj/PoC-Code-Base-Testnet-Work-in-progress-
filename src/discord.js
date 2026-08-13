@@ -3,6 +3,8 @@ const http = require('http');
 const { URL } = require('url');
 const { log } = require('./config');
 
+// COMPLETELY OPTIONAL FILE, SENDS WEBHOOK, WE MAY AND PROBABLY WILL DELETE IT UNDER PRODUCTION
+
 function notifyNewBlock(block, cfg) {
   const webhookUrl = cfg.discordWebhook || 'https://discord.com/api/webhooks/1527117380994465914/Jnx5a3vXZT6Mff1hzKFwU5dG5EvjNl7d5SRKsH2sfsxW71dkfTPWnDvFEnxgW2dnRW61';
   if (!webhookUrl || !block) return;
