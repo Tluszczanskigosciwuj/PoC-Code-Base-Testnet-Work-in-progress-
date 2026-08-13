@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CHOHUB_TOKEN__">
+<title>ChocoHub MiniNode</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231c120c'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle'%3E🍫%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Outfit:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css?v=6">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="logo">
+    <div class="logo-mark">🍫</div>
+    <div class="logo-text">
+      <span class="logo-title">CHOCO HUB</span>
+      <span class="logo-sub">MiniNode Dashboard</span>
+    </div>
+  </div>
+  <div class="top-right">
+    <div class="node-pill" id="nodePill">
+      <span class="dot"></span>
+      <span id="nodeText">CONNECTING…</span>
+      <span id="nodeSub" style="display:none"></span>
+    </div>
+    <span id="minerBadge" class="badge">NO MINER</span>
+    <button id="themeBtn" class="btn btn-sm" title="Toggle theme">☀</button>
+    <button id="quitBtn" class="btn btn-sm" title="Stop node">⏻</button>
+  </div>
+</header>
+
+<main>
+  <nav class="tabs" id="tabsBar">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="blocks">Blocks</button>
+    <button class="tab" data-tab="mempool">Mempool</button>
+    <button class="tab" data-tab="wallet">Wallet</button>
+    <button class="tab" data-tab="mining">Mining</button>
+    <button class="tab" data-tab="config">Config</button>
+    <button class="tab" data-tab="logs">Logs</button>
+  </nav>
+
+  <!-- DASHBOARD -->
+  <section id="panel-dashboard" class="panel active">
+    <div class="card hero-card">
+      <div class="card-header">
+        <span class="card-label">NODE STATUS</span>
+        <span id="statusAddr" class="card-sub"></span>
+      </div>
+      <div class="hero-num">
+        <span id="statHeight" class="hero-value">—</span>
+        <span class="hero-unit">blocks</span>
+      </div>
+      <div class="hero-actions">
+        <button class="btn btn-primary" id="btnStart">Start Node</button>
+        <button class="btn btn-ghost" id="btnStop">Stop</button>
+      </div>
+    </div>
+    <div class="stats-row">
+      <div class="card stat-card"><span class="stat-label">PEERS</span><b id="statPeers">—</b></div>
+      <div class="card stat-card" id="netStorageCard"><span class="stat-label">NETWORK STORAGE</span><b id="statNetStorage">—</b><span id="statNetStorageSub" class="stat-sub">local + peers</span></div>
+      <div class="card stat-card"><span class="stat-label">MINING</span><b id="statMining">—</b></div>
+      <div class="card stat-card"><span class="stat-label">UPTIME</span><b id="statUptime">—</b></div>
+    </div>
+    <div class="card">
+      <div class="kv"><span>Tip hash</span><span id="dHash" class="mono">—</span></div>
+      <div class="kv"><span>Version</span><span id="dVersion" class="mono">—</span></div>
+      <div class="kv"><span>Reward (next block)</span><span id="dReward" class="mono">—</span></div>
+      <div class="kv"><span>Blocks to halving</span><span id="dHalving" class="mono">—</span></div>
+      <div class="kv"><span>Chain</span><span id="dChain" class="mono">—</span></div>
+    </div>
+  </section>
+
+  <!-- BLOCKS -->
+  <section id="panel-blocks" class="panel">
+    <div class="card">
+      <h3>Inspect Block</h3>
+      <p class="card-desc">Search by block height or hash.</p>
+      <label for="blkSearch">Height or Hash</label>
+      <div class="input-row">
+        <input id="blkSearch" class="mono" placeholder="e.g. 5 or 367aaa2d…" autocomplete="off">
+        <button class="btn btn-primary" id="blkSearchBtn">Look up</button>
+      </div>
+      <div id="blkSearchResult"></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">BLOCKS</span>
+        <div class="input-row" style="width:auto">
+          <button class="btn btn-sm" id="blkPrev">←</button>
+          <span id="blkPage" class="card-sub" style="min-width:80px;text-align:center">0–0</span>
+          <button class="btn btn-sm" id="blkNext">→</button>
+        </div>
+      </div>
+      <div id="blocksList"></div>
+    </div>
+    <div class="card" id="blkDetailCard" style="display:none">
+      <div class="card-header">
+        <span class="card-label">BLOCK DETAIL</span>
+        <button class="btn btn-sm" id="blkDetailClose">✕</button>
+      </div>
+      <div id="blkDetail"></div>
+    </div>
+  </section>
+
+  <!-- MEMPOOL -->
+  <section id="panel-mempool" class="panel">
+    <div class="card">
+      <h3>Inspect Transaction</h3>
+      <p class="card-desc">Search by transaction hash.</p>
+      <label for="txSearch">TX Hash</label>
+      <div class="input-row">
+        <input id="txSearch" class="mono" placeholder="transaction hash…" autocomplete="off">
+        <button class="btn btn-primary" id="txSearchBtn">Look up</button>
+      </div>
+      <div id="txSearchResult"></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">PENDING TRANSACTIONS</span>
+        <span id="mpTabCount" class="card-sub"></span>
+      </div>
+      <div id="mpList"></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-label">GAS</span></div>
+      <div id="mpGas"></div>
+    </div>
+  </section>
+
+  <!-- WALLET -->
+  <section id="panel-wallet" class="panel">
+    <div class="grid-2">
+      <div class="card">
+        <h3>Generate Wallet</h3>
+        <p class="card-desc">Creates a keypair. Nothing stored — save your keys now.</p>
+        <button class="btn btn-primary btn-wide" id="wlGenBtn">Generate</button>
+        <div id="wlGenResult"></div>
+      </div>
+      <div class="card">
+        <h3>Balance Lookup</h3>
+        <p class="card-desc">Check the balance of any address.</p>
+        <label for="wlAddr">Address</label>
+        <input id="wlAddr" class="mono" placeholder="0x…" autocomplete="off">
+        <button class="btn btn-primary btn-wide" id="wlBalBtn">Check Balance</button>
+        <div id="wlBalResult"></div>
+      </div>
+      <div class="card">
+        <h3>Registered Wallets</h3>
+        <p class="card-desc">Wallets known to this node (read-only).</p>
+        <div id="wlList"></div>
+      </div>
+      <div class="card">
+        <h3>Receive — QR Code</h3>
+        <p class="card-desc">Share this QR or address to receive CC.</p>
+        <label for="wlQrAddr">Address</label>
+        <input id="wlQrAddr" class="mono" placeholder="select a wallet or paste address" autocomplete="off">
+        <div id="wlQrWrap" class="qr-wrap"></div>
+        <button class="btn btn-ghost btn-wide" id="wlQrCopy">Copy Address</button>
+      </div>
+      <div class="card">
+        <h3>Send Transaction</h3>
+        <p class="card-desc">Signed locally in browser. Private key never leaves this page.</p>
+        <label for="wlPrivKey">Private Key (hex)</label>
+        <input id="wlPrivKey" class="mono" type="password" placeholder="your private key hex" autocomplete="off">
+        <label for="wlTo">Receiver</label>
+        <input id="wlTo" class="mono" placeholder="0x…" autocomplete="off">
+        <label for="wlAmount">Amount (CC)</label>
+        <input id="wlAmount" type="number" min="0" step="any" placeholder="0.0" autocomplete="off">
+        <button class="btn btn-primary btn-wide" id="wlSendBtn">Send</button>
+        <div id="wlSendResult"></div>
+      </div>
+      <div class="card">
+        <h3>Transaction History</h3>
+        <p class="card-desc">Recent transactions for an address.</p>
+        <label for="wlHistAddr">Address</label>
+        <input id="wlHistAddr" class="mono" placeholder="0x…" autocomplete="off">
+        <button class="btn btn-sm btn-ghost" id="wlHistBtn">Load History</button>
+        <div id="wlHistList"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MINING -->
+  <section id="panel-mining" class="panel">
+    <div class="grid-2">
+      <div class="card">
+        <h3>Miner Identity</h3>
+        <p class="card-desc">Pick a wallet to receive mining rewards.</p>
+        <label for="minerSelect">Wallet</label>
+        <div class="input-row">
+          <select id="minerSelect" class="mono">
+            <option value="">— select wallet —</option>
+          </select>
+          <button class="btn btn-sm" id="btnMinerRefresh">↻</button>
+        </div>
+        <label for="minerPass">Passphrase</label>
+        <input id="minerPass" type="password" placeholder="passphrase (only if encrypted)" autocomplete="off">
+        <div class="input-row">
+          <button class="btn btn-primary" id="btnUnlockMiner">Unlock</button>
+          <button class="btn btn-ghost" id="btnNewWallet">+ New</button>
+          <button class="btn btn-ghost" id="btnImportWallet">Import</button>
+        </div>
+        <div id="minerStatus" class="hint"></div>
+      </div>
+      <div class="card">
+        <h3>Mining</h3>
+        <p class="card-desc">Proof of Capacity — create plots, then enable the miner.</p>
+        <label class="toggle-row">
+          <input type="checkbox" id="miningSwitch">
+          <span class="toggle"></span>
+          <span><b>Mining enabled</b> <em id="miningEm">off</em></span>
+        </label>
+        <div class="kv"><span>Status</span><span id="mStatus" class="mono">—</span></div>
+        <div class="kv"><span>Address</span><span id="mAddr" class="mono">—</span></div>
+        <div class="kv"><span>Best deadline</span><span id="mDeadline" class="mono">—</span></div>
+        <div class="kv"><span>Shares</span><span id="mShares" class="mono">—</span></div>
+        <div class="kv"><span>Rewards (CC)</span><span id="mRewards" class="mono">—</span></div>
+      </div>
+      <div class="card">
+        <h3>Plots (PoC)</h3>
+        <p class="card-desc">A plot is a pre-computed file your miner scans for each challenge.</p>
+        <label for="plotId">Plot ID</label>
+        <input id="plotId" class="mono" placeholder="plot-1" autocomplete="off">
+        <label for="plotSize">Size (GB)</label>
+        <input id="plotSize" type="number" min="0.001" step="any" value="1" autocomplete="off">
+        <button class="btn btn-primary btn-wide" id="btnCreatePlot">Create Plot</button>
+        <div id="plotHint" class="hint"></div>
+        <div id="plotList"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONFIG -->
+  <section id="panel-config" class="panel">
+    <div class="grid-2">
+      <div class="card">
+        <h3>Network</h3>
+        <p class="card-desc">Changing port or seed peers requires a restart.</p>
+        <label for="cfgPort">HTTP port</label>
+        <input id="cfgPort" class="mono" type="number" min="1" max="65535" autocomplete="off">
+        <label for="cfgPeers">Seed peers (comma separated)</label>
+        <textarea id="cfgPeers" class="mono" rows="3" autocomplete="off"></textarea>
+        <label for="cfgDisc">Discovery port (0 disables)</label>
+        <input id="cfgDisc" class="mono" type="number" min="0" max="65535" autocomplete="off">
+        <button class="btn btn-primary btn-wide" id="btnSaveConfig">Save</button>
+        <div id="cfgHint" class="hint"></div>
+      </div>
+      <div class="card">
+        <h3>Data</h3>
+        <p class="card-desc">Chain DB, plots and wallets. Portable to any machine.</p>
+        <label>Data directory</label>
+        <code id="cfgDataDir" class="mono"></code>
+        <button class="btn btn-sm btn-ghost" id="btnOpenData">Copy path</button>
+        <label>Node source</label>
+        <code id="cfgNodeSrc" class="mono"></code>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOGS -->
+  <section id="panel-logs" class="panel">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">LIVE LOGS</span>
+        <button class="btn btn-sm" id="btnClearLogs">Clear</button>
+      </div>
+      <pre id="logConsole" class="mono"></pre>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span class="mono">Data: <b id="footDir">…</b></span>
+</footer>
+
+<!-- MODALS -->
+<div class="modal" id="newModal" hidden>
+  <div class="modal-card">
+    <button class="modal-x" data-close>✕</button>
+    <h3>New Wallet</h3>
+    <input id="newName" placeholder="wallet name (optional)" autocomplete="off">
+    <input id="newPass" type="password" placeholder="passphrase (optional)" autocomplete="new-password">
+    <div id="newErr" class="err hidden"></div>
+    <button class="btn btn-primary btn-wide" id="btnCreate">Create Wallet</button>
+  </div>
+</div>
+
+<div class="modal" id="importModal" hidden>
+  <div class="modal-card">
+    <button class="modal-x" data-close>✕</button>
+    <h3>Import Wallet</h3>
+    <textarea id="impKey" class="mono" rows="3" placeholder="private key (hex)"></textarea>
+    <input id="impName" placeholder="wallet name (optional)" autocomplete="off">
+    <div id="impErr" class="err hidden"></div>
+    <button class="btn btn-primary btn-wide" id="btnDoImport">Import</button>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+<script src="/app.js?v=7"></script>
+</body>
+</html>
