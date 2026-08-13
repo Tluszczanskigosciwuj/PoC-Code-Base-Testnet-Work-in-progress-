@@ -84,9 +84,6 @@ class ChallengeManager {
     return result;
   }
 
-  // Pulls candidate txs from the mempool and drops any that would fail chain._validateTxOrder
-  // (bad signature, stale/out-of-order nonce, insufficient balance) instead of letting a single
-  // bad tx poison the whole block and stall forging forever. Bad txs are removed from the mempool.
   _selectValidMempoolTxs(chain, maxCount) {
     const candidates = chain.getMempoolForBlock(maxCount);
     log('info', `[TX] mempool candidates: ${candidates.length}`);
@@ -170,13 +167,6 @@ class ChallengeManager {
     const now = Math.floor(Date.now() / 1000);
     const nextHeight = chain.altura + 1;
     const existingBlock = this.db.prepare('SELECT hash, challenge_id FROM blocks WHERE height = ? ORDER BY LENGTH(chain_work) DESC, chain_work DESC LIMIT 1').get(nextHeight);
-
-    // A challenge is only still forgeable if it was created against the CURRENT tip lineage.
-    // If chain.altura has moved past (or diverged from) the height the challenge was created
-    // at — e.g. because we synced blocks from a peer in the meantime — the challenge's context
-    // (parent block, generation_signature) is stale. Forging it now would either be rejected
-    // downstream or, worse, produce a burst of blocks in rapid succession once several stale
-    // challenges become "eligible" at once. Mark those as abandoned instead of forging them.
     const stale = this.db.prepare(`SELECT challenge_id, block_height FROM mining_challenges
       WHERE forged_block_height IS NULL AND winner_deadline IS NOT NULL AND winner_miner IS NOT NULL
       AND (finalized_at + winner_deadline) <= ? AND block_height < ?`).all(now, chain.altura);
@@ -198,7 +188,7 @@ class ChallengeManager {
       } else {
         log('info', `Deadline elapsed — forging block for challenge ${ch.challenge_id.slice(0, 12)} (d=${ch.winner_deadline}s)`);
         this._forgeBlockForChallenge(chain, syncEngine, ch);
-        return; // one block per tick — never burst-forge multiple challenges in the same pass
+        return;
       }
     }
 
