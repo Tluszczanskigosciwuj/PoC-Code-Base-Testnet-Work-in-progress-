@@ -251,10 +251,6 @@ async function creditContractValue(vm, contractAddress, senderAddress, value) {
   });
 }
 
-// Credita `value` no saldo (account balance) de um contrato de forma determinística:
-// restaura o estado do DB, credita na trie do VM e persiste o novo balance. Usado pelo
-// caminho de consenso (addBlock) para txs de chamada com valor, mantendo o balance do
-// contrato capturado no contract_state_root.
 async function creditContractBalance(contractAddress, value) {
   assertValidAddress(contractAddress, 'contractAddress');
   const amount = new BN(value || 0);
