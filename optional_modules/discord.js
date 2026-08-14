@@ -4,7 +4,7 @@ const { URL } = require('url');
 const { log } = require('./config');
 
 function notifyNewBlock(block, cfg) {
-  const webhookUrl = cfg.discordWebhook || 'https://discord.com/api/webhooks/1527117380994465914/Jnx5a3vXZT6Mff1hzKFwU5dG5EvjNl7d5SRKsH2sfsxW71dkfTPWnDvFEnxgW2dnRW61';
+  const webhookUrl = cfg.discordWebhook || 'yourwebhookhere';
   if (!webhookUrl || !block) return;
 
   const nodeName = cfg.nodeName || cfg.nodeUrl || 'Node';
