@@ -25,6 +25,7 @@ if (args.includes('--help') || args.includes('-h')) {
     DB_PATH=./db/choco-node.db     Database path
     DATA_DIR=./node-data           Data directory
     PLOTS_DIR=./plots              Plot directory
+    PLOT_SIZE=0.01                Plot size in GB (overrides committed size_gb)
     ADMIN_TOKEN=...                Admin API token
 
   CONFIG FILES:

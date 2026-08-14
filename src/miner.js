@@ -54,6 +54,10 @@ class Miner {
     this.shares = 0;
     const now = Math.floor(Date.now() / 1000);
     this.db.prepare('INSERT OR IGNORE INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?,?)').run(this.address, this.cfg.minerPublicKey || '', '0', 0, now, now);
+    if (this.cfg.plotSizeGb) {
+      const up = this.db.prepare('UPDATE plot_commitments SET size_gb = ? WHERE miner = ?').run(this.cfg.plotSizeGb, this.address);
+      if (up.changes > 0) log('info', `Miner: plot size override PLOT_SIZE=${this.cfg.plotSizeGb} GB applied to ${up.changes} plot(s)`);
+    }
     log('info', `Miner started — address ${address.slice(0, 10)}…`);
     this._loop();
   }
@@ -81,7 +85,7 @@ class Miner {
     let bestProof = null, bestDeadline = Infinity, bestPlot = null;
     for (const plot of plots) {
       const plotPath = path.join(this.cfg.plotsDir, `${plot.plot_id}.plot`);
-      const proof = buildPocProof(plotPath, plot.plot_id, challenge, plot.size_gb);
+      const proof = buildPocProof(plotPath, plot.plot_id, challenge, this.cfg.plotSizeGb || plot.size_gb);
       this.totalScans++;
       if (proof && proof.deadline < bestDeadline) { bestDeadline = proof.deadline; bestProof = proof; bestPlot = plot; }
     }

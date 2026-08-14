@@ -39,6 +39,7 @@ function loadConfig() {
     minerAddress: '',
     minerPrivateKey: '',
     minerPublicKey: '',
+    plotSizeGb: 0,
     chainId: 19971971,
     chainName: 'CCpoc',
     symbol: 'CC',
@@ -92,6 +93,7 @@ function loadConfig() {
   }
 
   const envInt = (key, def) => { const v = process.env[key]; return v ? parseInt(v, 10) || def : def; };
+  const envFloat = (key, def) => { const v = process.env[key]; return v ? (parseFloat(v) || def) : def; };
   const envStr = (key, def) => process.env[key] || def;
   const envBool = (key, def) => { const v = process.env[key]; return v ? v.toLowerCase() === 'true' : def; };
 
@@ -110,6 +112,7 @@ function loadConfig() {
   defaults.minerAddress = envStr('MINER_ADDRESS', defaults.minerAddress);
   defaults.minerPrivateKey = envStr('MINER_PRIVATE_KEY', defaults.minerPrivateKey);
   defaults.minerPublicKey = envStr('MINER_PUBLIC_KEY', defaults.minerPublicKey);
+  defaults.plotSizeGb = envFloat('PLOT_SIZE', defaults.plotSizeGb);
   defaults.logLevel = envStr('LOG_LEVEL', defaults.logLevel);
   defaults.adminToken = envStr('ADMIN_TOKEN', defaults.adminToken);
   defaults.maxBlocksPerSync = envInt('MAX_BLOCKS_PER_SYNC', defaults.maxBlocksPerSync);
