@@ -1,37 +1,3 @@
-/*
- * LP.js — CONCEITO: troca atômica (HTLC) + pool de liquidez
- *
- * ESTE ARQUIVO É UM PROTÓTIPO/CONCEITO. Nada além de src/vm/ foi alterado.
- *
- * CONCEITO DA TROCA ATÔMICA P2P (sem custódia, sem admin, sem lucro):
- *
- *   Alice quer trocar 500 CC por 300 BTC (ou XNO/qualquer ativo). Bob aceita.
- *   Nenhum dos dois confia no outro nem em uma corretora. A garantia é feita
- *   por dois contratos HTLC (Hash Time-Locked Contract) ligados pela MESMA
- *   senha (preimage):
- *
- *   [1] HTLC-CC  : Alice deposita 500 CC. receiver=Bob. hashlock=H. timelock=T1.
- *   [2] HTLC-BTC : Bob deposita 300 BTC. receiver=Alice. hashlock=H. timelock=T2.
- *       com T2 < T1 (o timelock do Bob expira ANTES, protegendo quem recebe CC).
- *
- *   - Alice redeima o HTLC-BTC revelando a senha S (H = sha256(S)).
- *   - Bob vê S na blockchain e redeima o HTLC-CC antes de T1.
- *   - Se Alice sumir: após T2 Bob faz refund no HTLC-BTC; após T1 Alice faz
- *     refund no HTLC-CC. Ninguém perde fundos.
- *
- * XNO NÃO tem scripting/contratos -> o HTLC-BTC do lado XNO precisaria de um
- * "monitor/oráculo" (off-chain) para liberar os XNO mediante a senha revelada.
- * Para EVM (ETH/POL) os dois lados podem ser HTLC nativos (atomic swap dual).
- *
- * POOL DE LIQUIDEZ (fase seguinte): contrapartes nativas ao invés de matchup
- * direto. O EVM vira a "política de minting" da CC: depositantes fornecem
- * liquidez, taxas e eventos são auditáveis on-chain.
- *
- * Uso:
- *   node src/vm/LP.js          -> roda o demo completo do conceito HTLC
- *   node -e "require('./src/vm/LP.js')"  -> só carrega (sem efeitos colaterais)
- */
-
 const solc = require('solc');
 const abi = require('ethereumjs-abi');
 const crypto = require('crypto');
