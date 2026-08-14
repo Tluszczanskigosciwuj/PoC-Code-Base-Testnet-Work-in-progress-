@@ -1,15 +1,17 @@
 const crypto = require('crypto');
-const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, verifyMerkleProofBuf, computeDeadline, plotScoopCount, getTier, computeEffectiveCapacityGb, computeBaseTargetWithTier, TIERS, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, verifySignature, canonicalTxMessage } = require('./crypto');
+const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, verifyMerkleProofBuf, computeDeadline, plotScoopCount, getTier, computeEffectiveCapacityGb, computeBaseTargetWithTier, TIERS, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, verifySignature, canonicalTxMessage, proofMessage } = require('./crypto');
 const { log } = require('./config');
+const { runHook } = require('./optional');
 
 
 const TIER_REWARD_PCT = { tier_1: 8, tier_2: 12, tier_3: 20, tier_4: 25, tier_5: 35 };
 
 class ChallengeManager {
-  constructor(db, chain, cfg) {
+  constructor(db, chain, cfg, optionalModules = null) {
     this.db = db;
     this.cfg = cfg || {};
     this.chain = chain;
+    this.optionalModules = optionalModules;
   }
 
   getOrCreate() {
@@ -26,7 +28,7 @@ class ChallengeManager {
     const expired = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ? AND forged_block_height IS NULL AND expires_at <= ? AND challenge_id IN (SELECT DISTINCT challenge_id FROM challenge_submissions)').get(challengeId, now);
     if (expired) return { ...expired, base_target: baseTarget };
     const minTtl = Math.max(this.cfg.challengeTtlSec || 300, (this.cfg.expectedTimePerBlock || 240) * 5);
-    const ttl = this.chain.altura === 0 ? Math.max(20, this.cfg.expectedTimePerBlock || 240) : Math.max(minTtl, 86400);
+    const ttl = Math.max(minTtl, 86400);
     this.db.prepare('DELETE FROM mining_challenges WHERE forged_block_height IS NULL AND (challenge_id != ? OR expires_at + ? < ?) AND challenge_id NOT IN (SELECT DISTINCT challenge_id FROM challenge_submissions)').run(challengeId, challengeGrace, now);
     this.db.prepare('DELETE FROM mining_challenges WHERE challenge_id = ? AND (forged_block_height IS NOT NULL OR expires_at < ?)').run(challengeId, now - challengeGrace);
     const nonce = crypto.randomBytes(4).toString('hex');
@@ -71,7 +73,21 @@ class ChallengeManager {
     const merkleProof = proofPacket.merkle_proof || [];
     const leafHash = Buffer.from(proofPacket.scoop_data, 'hex');
     if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, plot.merkle_root)) return { ok: false, motivo: 'Merkle proof does not match committed plot root' };
-    this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, submitted_at) VALUES (?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, now);
+
+    // Verify proof signature — proves the submitter controls the claimed miner address
+    const proofSig = (proofPacket && proofPacket.proof_signature) || '';
+    if (proofSig) {
+      const pkRow = this.db.prepare('SELECT public_key_ed25519 FROM users WHERE lower(address) = lower(?)').get(miner);
+      if (pkRow && pkRow.public_key_ed25519) {
+        const msg = proofMessage(challengeId, miner, deadline, plotId);
+        if (!verifySignature(msg, proofSig, pkRow.public_key_ed25519)) {
+          return { ok: false, motivo: 'proof signature does not match miner address' };
+        }
+      }
+      // If no public key registered, skip verification (will fail at block validation)
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now);
     const updated = this.db.prepare('UPDATE mining_challenges SET winner_miner = ?, winner_deadline = ?, winner_plot_id = ?, finalized_at = ? WHERE challenge_id = ? AND (winner_deadline IS NULL OR ? < winner_deadline)').run(miner, deadline, plotId, now, challengeId, deadline);
     const subCount = this.db.prepare('SELECT COUNT(*) as cnt FROM challenge_submissions WHERE challenge_id = ?').get(challengeId).cnt;
     const result = { ok: true, submitted: true, challenge_id: challengeId, total_submissions: subCount };
@@ -84,6 +100,9 @@ class ChallengeManager {
     return result;
   }
 
+  // Pulls candidate txs from the mempool and drops any that would fail chain._validateTxOrder
+  // (bad signature, stale/out-of-order nonce, insufficient balance) instead of letting a single
+  // bad tx poison the whole block and stall forging forever. Bad txs are removed from the mempool.
   _selectValidMempoolTxs(chain, maxCount) {
     const candidates = chain.getMempoolForBlock(maxCount);
     log('info', `[TX] mempool candidates: ${candidates.length}`);
@@ -127,7 +146,7 @@ class ChallengeManager {
     return good;
   }
 
-  _forgeBlock(chain, challenge, miner, deadline, rewardDistribution = [], plotId = '', proofDigest = '') {
+  _forgeBlock(chain, challenge, miner, deadline, rewardDistribution = [], plotId = '', proofDigest = '', winnerProof = null) {
     try {
       miner = typeof miner === 'string' ? miner.toLowerCase() : miner;
       const newHeight = chain.altura + 1;
@@ -153,6 +172,7 @@ class ChallengeManager {
         transactions: mempoolTxs, signature: '', gas_used: mempoolTxs.length * 21000, gas_limit: 30000000,
         base_fee: String(chain._baseFeeForHeight(newHeight)),
         _from_local_forge: true, rewards: rewardDistribution,
+        winner_proof: winnerProof || null,
       };
       if (this.cfg.minerPrivateKey) {
         const { signMessage, blockMessage } = require('./crypto');
@@ -163,10 +183,17 @@ class ChallengeManager {
     } catch (e) { log('error', `forge block error: ${e.message}`); return null; }
   }
 
-  finalizeExpiredChallenges(chain, syncEngine) {
+  async finalizeExpiredChallenges(chain, syncEngine) {
     const now = Math.floor(Date.now() / 1000);
     const nextHeight = chain.altura + 1;
     const existingBlock = this.db.prepare('SELECT hash, challenge_id FROM blocks WHERE height = ? ORDER BY LENGTH(chain_work) DESC, chain_work DESC LIMIT 1').get(nextHeight);
+
+    // A challenge is only still forgeable if it was created against the CURRENT tip lineage.
+    // If chain.altura has moved past (or diverged from) the height the challenge was created
+    // at — e.g. because we synced blocks from a peer in the meantime — the challenge's context
+    // (parent block, generation_signature) is stale. Forging it now would either be rejected
+    // downstream or, worse, produce a burst of blocks in rapid succession once several stale
+    // challenges become "eligible" at once. Mark those as abandoned instead of forging them.
     const stale = this.db.prepare(`SELECT challenge_id, block_height FROM mining_challenges
       WHERE forged_block_height IS NULL AND winner_deadline IS NOT NULL AND winner_miner IS NOT NULL
       AND (finalized_at + winner_deadline) <= ? AND block_height < ?`).all(now, chain.altura);
@@ -175,10 +202,12 @@ class ChallengeManager {
       this.db.prepare('UPDATE mining_challenges SET forged_block_height = ? WHERE challenge_id = ? AND forged_block_height IS NULL').run(-1, s.challenge_id);
     }
 
+    const localMiner = String(this.cfg.minerAddress || '').toLowerCase();
     const readyToForge = this.db.prepare(`SELECT * FROM mining_challenges WHERE forged_block_height IS NULL
       AND winner_deadline IS NOT NULL AND winner_miner IS NOT NULL
+      AND lower(winner_miner) = lower(?)
       AND (finalized_at + winner_deadline) <= ? AND block_height >= ?
-      ORDER BY created_at ASC LIMIT 1`).get(now, chain.altura);
+      ORDER BY created_at ASC LIMIT 1`).get(localMiner, now, chain.altura);
     if (readyToForge) {
       const ch = readyToForge;
       if (existingBlock) {
@@ -187,17 +216,18 @@ class ChallengeManager {
         this.db.prepare('UPDATE mining_challenges SET forged_block_height = ? WHERE challenge_id = ? AND forged_block_height IS NULL').run(chain.altura, ch.challenge_id);
       } else {
         log('info', `Deadline elapsed — forging block for challenge ${ch.challenge_id.slice(0, 12)} (d=${ch.winner_deadline}s)`);
-        this._forgeBlockForChallenge(chain, syncEngine, ch);
-        return;
+        await this._forgeBlockForChallenge(chain, syncEngine, ch);
+        return; // one block per tick — never burst-forge multiple challenges in the same pass
       }
     }
 
     const expired = this.db.prepare(`SELECT * FROM mining_challenges WHERE forged_block_height IS NULL
       AND winner_deadline IS NOT NULL AND winner_miner IS NOT NULL
+      AND lower(winner_miner) = lower(?)
       AND (finalized_at + winner_deadline) <= ? AND block_height >= ?
       AND challenge_id NOT IN (SELECT DISTINCT challenge_id FROM blocks WHERE blocks.challenge_id = mining_challenges.challenge_id AND blocks.challenge_id != '')
       AND challenge_id IN (SELECT DISTINCT challenge_id FROM challenge_submissions)
-      ORDER BY created_at ASC LIMIT 1`).get(now, chain.altura);
+      ORDER BY created_at ASC LIMIT 1`).get(localMiner, now, chain.altura);
     if (expired) {
       const ch = expired;
       const chId = ch.challenge_id;
@@ -206,12 +236,12 @@ class ChallengeManager {
       } else if (chain.altura >= nextHeight) {
         this.db.prepare('UPDATE mining_challenges SET forged_block_height = ? WHERE challenge_id = ? AND forged_block_height IS NULL').run(chain.altura, chId);
       } else {
-        this._forgeBlockForChallenge(chain, syncEngine, ch);
+        await this._forgeBlockForChallenge(chain, syncEngine, ch);
       }
     }
   }
 
-  _forgeBlockForChallenge(chain, syncEngine, challenge) {
+  async _forgeBlockForChallenge(chain, syncEngine, challenge) {
     try {
       const nextHeight = chain.altura + 1;
       const existing = this.db.prepare('SELECT hash, challenge_id FROM blocks WHERE height = ? LIMIT 1').get(nextHeight);
@@ -222,6 +252,10 @@ class ChallengeManager {
       const validSubs = submissions.filter(s => s.deadline <= maxDl);
       if (!validSubs.length) return null;
       const winner = validSubs[0];
+      const localMiner = String(this.cfg.minerAddress || '').toLowerCase();
+      if (!this.cfg.minerPrivateKey || !localMiner || (winner.miner || '').toLowerCase() !== localMiner) {
+        return null;
+      }
       const totalReward = calculateMiningReward(chain.altura + 1, this.cfg);
       const winnerSharePct = this.cfg.winnerSharePct || 70;
       const poolSharePct = 100 - winnerSharePct;
@@ -253,15 +287,24 @@ class ChallengeManager {
       if (allocated < totalReward && distribution.length > 0) {
         distribution[0].reward_cc = String(BigInt(distribution[0].reward_cc) + (totalReward - allocated));
       }
-      const block = this._forgeBlock(chain, challenge, winner.miner, winner.deadline, distribution, winner.plot_id || '', winner.proof_digest || '');
+      // Build the winner_proof object from the winning submission's stored signature
+      const winnerProof = {
+        miner: (winner.miner || '').toLowerCase(),
+        deadline: winner.deadline,
+        plot_id: winner.plot_id || '',
+        proof_signature: winner.proof_signature || '',
+      };
+      const block = this._forgeBlock(chain, challenge, winner.miner, winner.deadline, distribution, winner.plot_id || '', winner.proof_digest || '', winnerProof);
       if (!block) return null;
-      const result = chain.addBlock(block, { skipStateValidation: true, skipPocValidation: true, skipSignature: true, skipTxValidation: true });
+      // skipSignature removed — block must be validated including winner_proof verification
+      const result = await chain.addBlock(block, { skipStateValidation: true, skipPocValidation: true, skipTxValidation: true });
       if (!result.ok) {
         log('error', `Block forge rejected for challenge ${challenge.challenge_id.slice(0, 12)}: ${result.motivo}`);
         return null;
       }
       this.db.prepare('UPDATE mining_challenges SET forged_block_height = ? WHERE challenge_id = ? AND forged_block_height IS NULL').run(block.height, challenge.challenge_id);
       log('info', `Block #${block.height} forged — challenge ${challenge.challenge_id.slice(0, 12)} (${distribution.length} miners, reward ${totalReward} CC)`);
+      runHook(this.optionalModules, 'notifyNewBlock', block, this.cfg);
       if (syncEngine) setImmediate(() => { syncEngine.broadcastBlock(block); });
       return block;
     } catch (e) { log('error', `forge error: ${e.message}`); return null; }

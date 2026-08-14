@@ -1,5 +1,5 @@
 const path = require('path');
-const { safeInt, safeBigInt } = require('./crypto');
+const { safeInt, safeBigInt, signMessage, proofMessage } = require('./crypto');
 const { buildPocProof } = require('./plot');
 const { fetchJSON } = require('./sync');
 const { log } = require('./config');
@@ -109,11 +109,21 @@ class Miner {
   async _submitProof(challengeId, plotId, deadline, proof) {
     const targets = [normalizeUrl(`http://127.0.0.1:${this.cfg.port}`)];
     const plot = this.db.prepare('SELECT size_gb FROM plot_commitments WHERE plot_id = ? AND miner = ?').get(plotId, this.address);
-    this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, submitted_at) VALUES (?,?,?,?,?,?,?)').run(challengeId, this.address, plotId, plot ? plot.size_gb : 0, deadline, proof.proof_digest || '', Math.floor(Date.now() / 1000));
+
+    // Sign the proof submission so the network can verify the miner owns this address
+    let proofSignature = '';
+    if (this.cfg.minerPrivateKey) {
+      try {
+        const msg = proofMessage(challengeId, this.address, deadline, plotId);
+        proofSignature = signMessage(msg, this.cfg.minerPrivateKey);
+      } catch (e) { log('warn', `Miner: failed to sign proof: ${e.message}`); }
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, this.address, plotId, plot ? plot.size_gb : 0, deadline, proof.proof_digest || '', proofSignature, Math.floor(Date.now() / 1000));
     for (const target of targets) {
       try {
         const resp = await fetchJSON(`${target}/api/mining/submit-proof`, {
-          method: 'POST', body: { challenge_id: challengeId, miner: this.address, plot_id: plotId, deadline, proof_packet: proof }, timeout: 8,
+          method: 'POST', body: { challenge_id: challengeId, miner: this.address, plot_id: plotId, deadline, proof_packet: proof, proof_signature: proofSignature }, timeout: 8,
         });
         if (resp && resp.ok) { this.shares++; log('info', `Proof accepted at ${target}`); return true; }
       } catch {}

@@ -13,6 +13,7 @@ const { SyncEngine } = require('./sync');
 const { Miner } = require('./miner');
 const { Server } = require('./server');
 const { DiscoveryServer, connectDiscoveryServer } = require('./discovery');
+const { setupOptionalModules, loadOptionalModules } = require('./optional');
 
 class NodeRegistry {
   constructor(db) {
@@ -44,7 +45,7 @@ class ChocoNode {
     this._stopDiscovery = null;
   }
 
-  start() {
+  async start() {
     const cfg = this.cfg;
     setLogLevel(cfg.logLevel);
 
@@ -62,12 +63,36 @@ class ChocoNode {
 
     this._printBanner();
 
+    try {
+      await setupOptionalModules(cfg);
+    } catch (e) {
+      log('warn', `Optional modules setup skipped: ${e.message}`);
+    }
+    this.optionalModules = loadOptionalModules();
+    if (Object.keys(this.optionalModules).length > 0) {
+      log('info', `Optional modules hooks: ${Object.keys(this.optionalModules).join(', ')}`);
+    }
+
     this.db = initDB(cfg.dbPath, cfg);
+    this.smartContracts = null;
+    if (cfg.smartContractsEnabled) {
+      try {
+        this.smartContracts = require('./vm/smartcontracts');
+        this.smartContracts.setDatabase(this.db);
+        log('info', `Smart contracts (EVM) enabled`);
+      } catch (e) {
+        log('warn', `Smart contracts enabled but VM unavailable: ${e.message}`);
+        this.smartContracts = null;
+      }
+    } else {
+      log('info', `Smart contracts (EVM) disabled`);
+    }
 
     this.chain = new Chain(this.db, cfg);
+    if (this.smartContracts) this.chain.setContractExecutor(this.smartContracts);
     this.peers = new PeerManager(this.db, cfg);
     for (const seed of (cfg.seedPeers || [])) this.peers.add(seed);
-    this.challengeMgr = new ChallengeManager(this.db, this.chain, cfg);
+    this.challengeMgr = new ChallengeManager(this.db, this.chain, cfg, this.optionalModules);
     this.registry = new NodeRegistry(this.db);
     this.sync = new SyncEngine(this.db, cfg, this.chain, this.peers, this.challengeMgr, this.NODE_ID);
     this.miner = new Miner(this.db, cfg, this.chain, this.challengeMgr, this.sync, this.peers, this.NODE_ID);
@@ -77,13 +102,13 @@ class ChocoNode {
       this.discoveryServer.start();
     }
 
-    this.server = new Server(cfg, this.db, this.chain, this.peers, this.sync, this.miner, this.challengeMgr, this.registry, this.NODE_ID);
+    this.server = new Server(cfg, this.db, this.chain, this.peers, this.sync, this.miner, this.challengeMgr, this.registry, this.NODE_ID, this.smartContracts);
     this.server.start();
 
     setInterval(() => { try { this.peers.decayHealth(); } catch {} }, 300000);
     setInterval(() => { try { this.chain.cleanMempool(); } catch {} }, 60000);
     setInterval(() => { try { this.chain.prune(); } catch {} }, 600000);
-    setInterval(() => { try { this.challengeMgr.finalizeExpiredChallenges(this.chain, this.sync); } catch (e) { log('error', `Finalize error: ${e.message}`); } }, 5000);
+    setInterval(() => { this.challengeMgr.finalizeExpiredChallenges(this.chain, this.sync).catch(e => log('error', `Finalize error: ${e.message}`)); }, 5000);
     setInterval(() => { this.sync.loopSync().catch(() => {}); }, cfg.syncIntervalMs || 10000);
     setInterval(() => { this.sync.heartbeat().catch(() => {}); }, cfg.heartbeatMs || 20000);
     setInterval(() => { this.sync.discoverPeers().catch(() => {}); }, cfg.discoveryMs || 30000);

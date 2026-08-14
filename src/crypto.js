@@ -234,16 +234,17 @@ function verifyMerkleProof(leafHash, leafIndex, totalLeaves, proof, root) {
 function canonicalTxMessage(tx) {
   return JSON.stringify({
     chain_id: String(tx.chain_id || '0'),
+    data: String(tx.data || ''),
     fee: String(tx.fee || '0'),
     from_addr: tx.from_addr,
     gas_limit: tx.gas_limit || 21000,
     gas_price: String(tx.gas_price || '1'),
     nonce: tx.nonce,
     priority_fee: String(tx.priority_fee || '0'),
-    to_addr: tx.to_addr,
+    to_addr: tx.to_addr || '',
     value: String(tx.value),
   }, [
-    'chain_id', 'fee', 'from_addr', 'gas_limit', 'gas_price',
+    'chain_id', 'data', 'fee', 'from_addr', 'gas_limit', 'gas_price',
     'nonce', 'priority_fee', 'to_addr', 'value',
   ].sort());
 }
@@ -251,22 +252,36 @@ function canonicalTxMessage(tx) {
 function hashTransaction(tx) {
   const d = {
     chain_id: String(tx.chain_id || '0'),
+    data: String(tx.data || ''),
     fee: String(tx.fee || '0'),
     from_addr: tx.from_addr,
     gas_limit: tx.gas_limit || 21000,
     gas_price: String(tx.gas_price || '1'),
     nonce: tx.nonce,
     priority_fee: String(tx.priority_fee || '0'),
-    to_addr: tx.to_addr,
+    to_addr: tx.to_addr || '',
     value: String(tx.value),
   };
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
 }
 
+// Canonical message for proof-of-capacity submission signing.
+// The miner signs this to prove they control the claimed address and submitted this proof.
+function proofMessage(challengeId, miner, deadline, plotId) {
+  return JSON.stringify({
+    type: 'poc_proof',
+    challenge_id: String(challengeId),
+    miner: String(miner).toLowerCase(),
+    deadline: String(deadline),
+    plot_id: String(plotId),
+  }, ['type', 'challenge_id', 'miner', 'deadline', 'plot_id'].sort());
+}
+
 function hashBlock(bloco) {
   let rewardsStr = '';
   if (Array.isArray(bloco.rewards)) {
-    // normalize key, got problem with it some times :/
+    // Normalize key order per reward entry so equivalent reward sets always hash the same,
+    // regardless of the property insertion order used by the caller.
     const normalized = bloco.rewards.map(r => {
       const n = {};
       for (const k of Object.keys(r).sort()) n[k] = r[k];
@@ -274,7 +289,14 @@ function hashBlock(bloco) {
     });
     rewardsStr = JSON.stringify(normalized);
   }
+  let winnerProofStr = '';
+  if (bloco.winner_proof && typeof bloco.winner_proof === 'object') {
+    const wp = {};
+    for (const k of Object.keys(bloco.winner_proof).sort()) wp[k] = bloco.winner_proof[k];
+    winnerProofStr = JSON.stringify(wp);
+  }
   const d = {
+    contract_state_root: bloco.contract_state_root || '',
     generation_signature: bloco.generation_signature || ZERO_HASH,
     height: bloco.height || 0,
     miner: bloco.miner || '',
@@ -287,16 +309,37 @@ function hashBlock(bloco) {
     tx_count: parseInt(bloco.tx_count || 0, 10),
     tx_root: bloco.tx_root || '',
     state_root: bloco.state_root || '',
+    winner_proof: winnerProofStr,
   };
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
 }
 
 function blockMessage(bloco) { return hashBlock(bloco); }
 
+function computeContractStateLeaves(db) {
+  const leaves = [];
+  const storage = db.prepare('SELECT contract_address, slot, value FROM smart_contract_storage ORDER BY lower(contract_address), slot').all();
+  for (const s of storage) leaves.push(sha256hex(`storage:${String(s.contract_address).toLowerCase()}:${s.slot}:${s.value}`));
+  const accounts = db.prepare('SELECT address, balance FROM smart_contract_accounts ORDER BY lower(address)').all();
+  for (const a of accounts) leaves.push(sha256hex(`account:${String(a.address).toLowerCase()}:${a.balance}`));
+  const contracts = db.prepare('SELECT address, creator, code FROM smart_contracts ORDER BY lower(address)').all();
+  for (const c of contracts) {
+    const codeHash = crypto.createHash('sha256').update(String(c.code || '')).digest('hex');
+    leaves.push(sha256hex(`code:${String(c.address).toLowerCase()}:${String(c.creator || '').toLowerCase()}:${codeHash}`));
+  }
+  return leaves;
+}
+
+// Raiz apenas do estado de contratos (storage + balances + code). Determinística entre
+// nós com a mesma sequência de blocos — alvo de validação no broadcast.
+function computeContractStateRoot(db) {
+  return merkleRoot(computeContractStateLeaves(db));
+}
+
 function computeStateRoot(db) {
   const rows = db.prepare('SELECT address, balance, nonce FROM users ORDER BY address').all();
   const leaves = rows.map(r => sha256hex(`${r.address}:${r.balance}:${r.nonce}`));
-  return merkleRoot(leaves);
+  return merkleRoot([...leaves, ...computeContractStateLeaves(db)]);
 }
 
 function computeStateRootAfterTxs(db, txs, rewards) {
@@ -447,8 +490,8 @@ function getChainWorkForBlock(blk) {
 module.exports = {
   ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, pubkeyToAddress, pubKeyToAddress,
   signMessage, verifySignature, merkleRoot, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf,
-  canonicalTxMessage, hashTransaction, hashBlock, blockMessage,
-  computeStateRoot, computeStateRootAfterTxs, calculateMiningReward, isBetterChainCandidate,
+  canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage,
+  computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, calculateMiningReward, isBetterChainCandidate,
   SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V1, PLOT_FORMAT_V2, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
   TIERS, EFFECTIVE_CAPACITY_CAP_GB, getTier, computeEffectiveCapacityGb, computeBaseTargetWithTier,

@@ -114,7 +114,7 @@ function buildPocProof(plotPath, plotId, challenge, plotSizeGb) {
         const buf = Buffer.alloc(scoopSize);
         const bytes = fs.readSync(fd, buf, 0, scoopSize, pos);
         if (bytes < scoopSize) buf.fill(0, bytes);
-        const dl = computeDeadline(buf, genSig, plotSizeGb);
+        const dl = computeDeadline(buf, genSig, plotSizeGb, challenge.base_target || undefined);
         if (dl < bestDeadline) { bestDeadline = dl; bestScoopData = buf; bestScoopIndex = i; }
       }
       if (bestDeadline === Infinity || bestDeadline <= 0) return null;
@@ -186,9 +186,7 @@ function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
   for (let n = 0; n < numNonces; n++) {
     const nonceScoops = Math.min(scoopsPerNonce, totalScoops - n * scoopsPerNonce);
     const scoopData = generateV3Scoops(accountId, n, nonceScoops);
-    for (let i = 0; i < nonceScoops; i++) {
-      sha256buf(scoopData.slice(i * 32, (i + 1) * 32)).copy(leafBuf, (n * scoopsPerNonce + i) * 32);
-    }
+    scoopData.copy(leafBuf, n * scoopsPerNonce * 32, 0, nonceScoops * 32);
   }
 
   const treeNodes = computeMerkleTreeNodes(leafBuf, totalScoops);

@@ -4,8 +4,6 @@ const { ChocoNode } = require('./node');
 
 const args = process.argv.slice(2);
 
-// notes for future, we should remake this, bc it looks bad
-
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`
   ChocoNode — PoC Testnet Node
@@ -29,7 +27,8 @@ if (args.includes('--help') || args.includes('-h')) {
     PLOTS_DIR=./plots              Plot directory
     ADMIN_TOKEN=...                Admin API token
 
-  CONFIG FILE:
+  CONFIG FILES:
+    config.env                     KEY=VALUE overrides (loaded automatically)
     node_config.json               Auto-generated, overrides defaults
 
   EXAMPLES:

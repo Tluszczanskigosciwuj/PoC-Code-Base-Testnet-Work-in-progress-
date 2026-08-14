@@ -1,6 +1,8 @@
-const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRoot, computeStateRootAfterTxs, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage } = require('./crypto');
+const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage } = require('./crypto');
 const { estimateIntrinsicGas, nextBaseFee, GAS_PARAMS } = require('./consensus/gas');
 const { log } = require('./config');
+const BN = require('bn.js');
+const Block = require('ethereumjs-block');
 
 const FINALIZATION_DEPTH = 30;
 function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; }
@@ -11,11 +13,16 @@ class Chain {
     this.cfg = cfg;
     this.altura = 0;
     this.melhorHash = ZERO_HASH;
+    this.contracts = null;
     this._loadTip();
     if (!this.getBlock(0)) this._initGenesis();
     try { this.db.prepare('ALTER TABLE transactions ADD COLUMN block_hash TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
       try { this.db.prepare('ALTER TABLE blocks ADD COLUMN base_target TEXT').run(); } catch (e) { /* already exists */ }
+      try { this.db.prepare('ALTER TABLE blocks ADD COLUMN contract_state_root TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
+      try { this.db.prepare('ALTER TABLE transactions ADD COLUMN data TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
   }
+
+  setContractExecutor(sc) { this.contracts = sc; }
 
   _initGenesis() {
     const cfg = this.cfg;
@@ -30,7 +37,7 @@ class Chain {
       reward_units: '0', reward_cc: String(reward), tx_count: 0,
       signature: '', generation_signature: ZERO_HASH,
       proof_digest: '', plot_id: '', state_root,
-      origin: 'genesis', total_fees_units: '0', gas_used: 0, gas_limit: 30000000, base_target: String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
+      origin: 'genesis', total_fees_units: '0', gas_used: 0, gas_limit: 30000000, base_target: this._defaultBaseTarget(),
       transactions: [], rewards: [],
     };
     genesis.hash = hashBlock(genesis);
@@ -58,6 +65,13 @@ class Chain {
     if (row) { this.altura = row.height; this.melhorHash = row.hash; }
   }
 
+  _attachTransactions(bloco) {
+    if (bloco && !Array.isArray(bloco.transactions)) {
+      bloco.transactions = this.db.prepare('SELECT * FROM transactions WHERE block_hash = ? ORDER BY rowid').all(bloco.hash);
+    }
+    return bloco;
+  }
+
   getBlock(heightOrHash) {
     let row;
     if (typeof heightOrHash === 'number' || /^\d+$/.test(String(heightOrHash))) {
@@ -65,10 +79,10 @@ class Chain {
     } else {
       row = this.db.prepare('SELECT * FROM blocks WHERE hash = ?').get(heightOrHash);
     }
-    return row || null;
+    return this._attachTransactions(row);
   }
 
-  getBlockByHash(hash) { return this.db.prepare('SELECT * FROM blocks WHERE hash = ?').get(hash) || null; }
+  getBlockByHash(hash) { return this._attachTransactions(this.db.prepare('SELECT * FROM blocks WHERE hash = ?').get(hash)); }
 
   getStats() {
     const tip = this.getBlock(this.altura);
@@ -83,7 +97,7 @@ class Chain {
     return {
       altura: this.altura, hash: this.melhorHash, blocos: totalBlocks,
       usuarios: wallets, total_txs: totalTxs, mempool: mempoolCount,
-      plots_count: plotsCount, capacidade_gb: Number(capacityGb.toFixed(2)),
+      plots_count: plotsCount, capacidade_gb: Number(capacityGb.toFixed(2)), // capacityGb is now guaranteed numeric
       chain_work: (tip && tip.chain_work) || '0',
       supply: String(supply), max_deadline: this.computeMaxDeadline(),
       base_target: (tip && tip.base_target) || String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
@@ -122,21 +136,25 @@ class Chain {
     } catch { return 1n; }
   }
 
+  _defaultBaseTarget() {
+    return String(BigInt(2) ** BigInt(64) / BigInt(120));
+  }
+
   _baseTargetForHeight(height) {
-    if (height === 0) return String(BigInt(2) ** BigInt(64) / BigInt(5898240));
+    if (height === 0) return this._defaultBaseTarget();
     const windowSize = this.cfg.difficultyAdjustBlocks || 8192;
     if (height < windowSize) {
       const prev = this.db.prepare('SELECT base_target FROM blocks WHERE height = ?').get(height - 1);
-      return (prev && prev.base_target) ? prev.base_target : String(BigInt(2) ** BigInt(64) / BigInt(5898240));
+      return (prev && prev.base_target) ? prev.base_target : this._defaultBaseTarget();
     }
     const latest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(height - 1);
     const oldest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(height - windowSize);
-    if (!latest || !oldest) return String(BigInt(2) ** BigInt(64) / BigInt(5898240));
+    if (!latest || !oldest) return this._defaultBaseTarget();
     const actualDuration = latest.timestamp - oldest.timestamp;
     const expectedDuration = (this.cfg.expectedTimePerBlock || 240) * (windowSize - 1);
-    if (actualDuration <= 0) return String(BigInt(2) ** BigInt(64) / BigInt(5898240));
+    if (actualDuration <= 0) return this._defaultBaseTarget();
     const prevRow = this.db.prepare('SELECT base_target FROM blocks WHERE height = ?').get(height - 1);
-    const prevTarget = BigInt((prevRow && prevRow.base_target) || String(BigInt(2) ** BigInt(64) / BigInt(5898240)));
+    const prevTarget = BigInt((prevRow && prevRow.base_target) || this._defaultBaseTarget());
     const ratio = (BigInt(actualDuration) * 1000n) / BigInt(expectedDuration);
     let newTarget = (prevTarget * ratio) / 1000n;
     if (newTarget > prevTarget * 4n) newTarget = prevTarget * 4n;
@@ -158,8 +176,8 @@ class Chain {
     ));
 }
 
-  addBlock(bloco, opts = {}) {
-    const { skipTxValidation = false, skipPocValidation = false, skipStateValidation = false, skipSignature = false, skipHashValidation = false, skipTargetValidation = false, forceSync = false } = opts;
+  async addBlock(bloco, opts = {}) {
+    const { skipTxValidation = false, skipPocValidation = false, skipStateValidation = false, skipSignature = false, skipHashValidation = false, skipTargetValidation = false, forceSync = false, skipContractStateValidation = false } = opts;
     const isLocalForge = !!bloco._from_local_forge;
     const blockOrigin = isLocalForge ? 'local' : 'network';
     delete bloco._from_local_forge;
@@ -209,6 +227,46 @@ class Chain {
       const pkRow = this.db.prepare('SELECT public_key_ed25519 FROM users WHERE address = ?').get(bloco.miner);
       if (!pkRow || !pkRow.public_key_ed25519) return { ok: false, motivo: 'miner not registered or no key' };
       if (!verifySignature(blockMessage(bloco), bloco.signature, pkRow.public_key_ed25519)) return { ok: false, motivo: 'invalid block signature' };
+
+      // Verify winner_proof: proves the claimed miner actually submitted the winning proof
+      const wp = bloco.winner_proof;
+      if (bloco.challenge_id && wp && wp.proof_signature) {
+        const wpMiner = normalizeAddr(wp.miner || '');
+        if (wpMiner !== bloco.miner) {
+          return { ok: false, motivo: 'winner_proof.miner does not match block.miner' };
+        }
+        const wpPk = this.db.prepare('SELECT public_key_ed25519 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
+        if (!wpPk || !wpPk.public_key_ed25519) {
+          return { ok: false, motivo: 'winner_proof miner has no public key' };
+        }
+        const wpMsg = proofMessage(bloco.challenge_id, wpMiner, wp.deadline, wp.plot_id);
+        if (!verifySignature(wpMsg, wp.proof_signature, wpPk.public_key_ed25519)) {
+          return { ok: false, motivo: 'invalid winner_proof signature — miner did not submit this proof' };
+        }
+      } else if (bloco.challenge_id && height > 0 && !bloco.challenge_id.startsWith('0x0000')) {
+        // For non-genesis blocks with a challenge, require winner_proof
+        // (relaxed for backward compatibility with pre-security blocks)
+        const hasSubmissions = this.db.prepare('SELECT 1 FROM challenge_submissions WHERE challenge_id = ? LIMIT 1').get(bloco.challenge_id);
+        if (hasSubmissions) {
+          return { ok: false, motivo: 'block missing winner_proof for challenge with submissions' };
+        }
+      }
+
+      // Cross-check reward distribution against actual challenge submissions
+      const rewardsData = bloco.rewards || [];
+      if (rewardsData.length > 0 && bloco.challenge_id) {
+        const subs = this.db.prepare('SELECT miner, plot_id, deadline FROM challenge_submissions WHERE challenge_id = ?').all(bloco.challenge_id);
+        const subKeys = new Set(subs.map(s => `${normalizeAddr(s.miner)}:${s.plot_id || ''}:${s.deadline}`));
+        for (const r of rewardsData) {
+          if (typeof r !== 'object' || !r.miner) continue;
+          const key = `${normalizeAddr(r.miner)}:${r.plot_id || ''}:${r.deadline}`;
+          if (!subKeys.has(key)) {
+            log('warn', `reward entry for ${r.miner} has no matching submission in challenge ${bloco.challenge_id.slice(0, 12)}`);
+            // Reject blocks that reward miners who never submitted proofs
+            return { ok: false, motivo: `reward for ${r.miner} has no matching proof submission` };
+          }
+        }
+      }
     }
     const now = Math.floor(Date.now() / 1000);
     const rewardsData = bloco.rewards || [];
@@ -224,87 +282,222 @@ class Chain {
     if (existingAtHeight && existingAtHeight.hash !== bloco.hash) {
       if (forceSync) {
         log('debug', `addBlock forceSync h=${height} local=${existingAtHeight.hash.slice(0, 10)} remote=${bloco.hash.slice(0, 10)}`);
-        const reorgResult = this.reorganize(bloco, true);
+        const reorgResult = await this.reorganize(bloco, true);
         if (!reorgResult.ok) return { ok: false, motivo: `sync reorg failed: ${reorgResult.motivo}` };
         return { ok: true, motivo: 'sync reorg accepted', height: this.altura, hash: this.melhorHash };
       }
       const existingBlock = this.getBlockByHash(existingAtHeight.hash);
       if (isBetterChainCandidate(bloco, existingBlock)) {
         log('debug', `addBlock better candidate h=${height} local=${existingBlock.hash.slice(0, 10)} remote=${bloco.hash.slice(0, 10)}`);
-        const reorgResult = this.reorganize(bloco);
+        const reorgResult = await this.reorganize(bloco);
         if (!reorgResult.ok) return { ok: false, motivo: `reorg failed: ${reorgResult.motivo}` };
         return { ok: true, motivo: 'reorganized to better tip', height: this.altura, hash: this.melhorHash };
       } else {
         return { ok: false, motivo: 'competing block not better than incumbent' };
       }
     }
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO blocks (height, hash, parent_hash, timestamp, miner, challenge_id, tx_root, nonce, difficulty, target,
-        reward_units, reward_cc, tx_count, chain_work, signature, generation_signature, proof_digest, plot_id, state_root, origin,
-        total_fees_units, gas_used, gas_limit, base_target, base_fee) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-        height, bloco.hash, bloco.parent_hash, bloco.timestamp, bloco.miner || '',
-        bloco.challenge_id || '', bloco.tx_root || '', String(bloco.nonce || '0'),
-        bloco.difficulty || '0', String(bloco.target || '0'), bloco.reward_units || '0',
-        rewardStr, txs.length, String(newWork), bloco.signature || '',
-        bloco.generation_signature || ZERO_HASH, bloco.proof_digest || '',
-        bloco.plot_id || '', bloco.state_root || '', blockOrigin,
-        String(totalTxFees), gasUsed, bloco.gas_limit || 30000000, bloco.base_target || String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
-        bloco.base_fee || String(this._baseFeeForHeight(height))
-      );
-      for (const d of rewardsData) {
-        if (typeof d !== 'object' || !d.miner) continue;
-        const rewardCc = safeBigInt(d.reward_cc, 0n);
-        if (rewardCc > 0n) {
-          const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(d.miner);
-          const curBalance = safeBigInt(cur ? cur.balance : 0n, 0n);
-          const newBalance = curBalance + rewardCc;
-          if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(newBalance), now, d.miner);
-          else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(d.miner, String(rewardCc), 0, now, now);
+
+    // Pré-execução determinística de txs de contrato (create/call) fora da transação SQLite
+    // (o VM é async). O estado de contratos resultante vai para as tabelas e é capturado no
+    // contract_state_root / state_root. Em caso de rejeição do bloco, _restoreContractState
+    // devolve as tabelas ao estado pré-bloqueio.
+    let contractExec = null;
+    const contractTxs = txs.filter(t => this._isContractOp(t));
+    if (contractTxs.length) {
+      if (!this.contracts) return { ok: false, motivo: 'block contains contract txs but smart contracts are disabled' };
+      contractExec = await this._preExecuteContracts(bloco, txs);
+      if (!contractExec.ok) {
+        contractExec.rollback();
+        return { ok: false, motivo: contractExec.motivo };
+      }
+    }
+
+    try {
+      this.db.transaction(() => {
+        for (const d of rewardsData) {
+          if (typeof d !== 'object' || !d.miner) continue;
+          const rewardCc = safeBigInt(d.reward_cc, 0n);
+          if (rewardCc > 0n) {
+            const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(d.miner);
+            const curBalance = safeBigInt(cur ? cur.balance : 0n, 0n);
+            const newBalance = curBalance + rewardCc;
+            if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(newBalance), now, d.miner);
+            else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(d.miner, String(rewardCc), 0, now, now);
+          }
+          this.db.prepare('INSERT OR IGNORE INTO block_rewards (block_height, block_hash, challenge_id, miner, plot_id, size_gb, share_pct, reward_cc, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(height, bloco.hash, bloco.challenge_id || '', d.miner, d.plot_id || '', d.size_gb || 0, d.share_pct || 0, String(rewardCc), now);
         }
-        this.db.prepare('INSERT OR IGNORE INTO block_rewards (block_height, block_hash, challenge_id, miner, plot_id, size_gb, share_pct, reward_cc, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(height, bloco.hash, bloco.challenge_id || '', d.miner, d.plot_id || '', d.size_gb || 0, d.share_pct || 0, String(rewardCc), now);
-      }
-      if (rewardsData.length === 0 && bloco.miner && bloco.miner !== 'genesis' && height > 0) {
-        const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(bloco.miner);
-        if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) + reward), now, bloco.miner);
-        else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(bloco.miner, rewardStr, 0, now, now);
-        this.db.prepare('INSERT OR IGNORE INTO block_rewards (block_height, block_hash, challenge_id, miner, plot_id, size_gb, share_pct, reward_cc, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(height, bloco.hash, bloco.challenge_id || '', bloco.miner, bloco.plot_id || '', 0, 100, rewardStr, now);
-      }
-      for (const tx of txs) {
-        const txHash = tx.hash || hashTransaction(tx);
-        this.db.prepare('INSERT OR IGNORE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr, String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash);
-        if (tx.from_addr) {
-          const cur = this.db.prepare('SELECT balance, nonce FROM users WHERE address = ?').get(tx.from_addr);
-          if (cur) {
-            const curBalance = safeBigInt(cur.balance, 0n);
-            const newBalance = curBalance - safeBigInt(tx.value, 0n) - safeBigInt(tx.fee, 0n);
-            this.db.prepare('UPDATE users SET balance = ?, nonce = ?, updated_at = ? WHERE address = ?').run(String(newBalance), Math.max(safeInt(cur.nonce, 0) + 1, safeInt(tx.nonce, 0) + 1), now, tx.from_addr);
+        // Empty distribution fallback REMOVED: blocks without a verified reward distribution
+        // no longer grant the entire reward to block.miner. This prevents forgers from
+        // stealing rewards by omitting the distribution array.
+        for (const tx of txs) {
+          const txHash = tx.hash || hashTransaction(tx);
+          this.db.prepare('INSERT OR IGNORE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash, String(tx.data || ''));
+          if (tx.from_addr) {
+            const cur = this.db.prepare('SELECT balance, nonce FROM users WHERE address = ?').get(tx.from_addr);
+            if (cur) {
+              const curBalance = safeBigInt(cur.balance, 0n);
+              const newBalance = curBalance - safeBigInt(tx.value, 0n) - safeBigInt(tx.fee, 0n);
+              this.db.prepare('UPDATE users SET balance = ?, nonce = ?, updated_at = ? WHERE address = ?').run(String(newBalance), Math.max(safeInt(cur.nonce, 0) + 1, safeInt(tx.nonce, 0) + 1), now, tx.from_addr);
+            }
+          }
+          const isContractRecipient = this._isContractCall(tx);
+          if (tx.to_addr && !isContractRecipient) {
+            const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(tx.to_addr);
+            const curBalance = safeBigInt(cur ? cur.balance : 0n, 0n);
+            const newBalance = curBalance + safeBigInt(tx.value, 0n);
+            if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(newBalance), now, tx.to_addr);
+            else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(tx.to_addr, String(safeBigInt(tx.value, 0n)), 0, now, now);
+          }
+          this.db.prepare('DELETE FROM mempool WHERE hash = ?').run(txHash);
+        }
+        // state_root/contract_state_root são calculados APÓS a aplicação de recompensas e
+        // txs (usuários), para que o root reflita o estado pós-bloco — o mesmo valor que
+        // nós remotos validarão ao receber o bloco.
+        if (isLocalForge) {
+          bloco.contract_state_root = computeContractStateRoot(this.db);
+          bloco.state_root = computeStateRoot(this.db);
+          bloco.hash = hashBlock(bloco);
+          if (this.cfg.minerPrivateKey) {
+            try { bloco.signature = signMessage(blockMessage(bloco), this.cfg.minerPrivateKey); } catch {}
           }
         }
-        if (tx.to_addr) {
-          const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(tx.to_addr);
-          const curBalance = safeBigInt(cur ? cur.balance : 0n, 0n);
-          const newBalance = curBalance + safeBigInt(tx.value, 0n);
-          if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(newBalance), now, tx.to_addr);
-          else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(tx.to_addr, String(safeBigInt(tx.value, 0n)), 0, now, now);
+        this.db.prepare(`INSERT INTO blocks (height, hash, parent_hash, timestamp, miner, challenge_id, tx_root, nonce, difficulty, target,
+          reward_units, reward_cc, tx_count, chain_work, signature, generation_signature, proof_digest, plot_id, state_root, origin,
+          total_fees_units, gas_used, gas_limit, base_target, base_fee, contract_state_root) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          height, bloco.hash, bloco.parent_hash, bloco.timestamp, bloco.miner || '',
+          bloco.challenge_id || '', bloco.tx_root || '', String(bloco.nonce || '0'),
+          bloco.difficulty || '0', String(bloco.target || '0'), bloco.reward_units || '0',
+          rewardStr, txs.length, String(newWork), bloco.signature || '',
+          bloco.generation_signature || ZERO_HASH, bloco.proof_digest || '',
+          bloco.plot_id || '', bloco.state_root || '', blockOrigin,
+          String(totalTxFees), gasUsed, bloco.gas_limit || 30000000, bloco.base_target || String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
+          bloco.base_fee || String(this._baseFeeForHeight(height)),
+          bloco.contract_state_root || ''
+        );
+        if (!skipStateValidation) {
+          const actualStateRoot = computeStateRoot(this.db);
+          const claimedStateRoot = bloco.state_root || '';
+          if (claimedStateRoot && claimedStateRoot !== actualStateRoot) {
+            log('warn', `state_root mismatch at #${height}`);
+            throw new Error('state_root mismatch');
+          }
         }
-        this.db.prepare('DELETE FROM mempool WHERE hash = ?').run(txHash);
-      }
-      if (!skipStateValidation) {
-        const actualStateRoot = computeStateRoot(this.db);
-        const claimedStateRoot = bloco.state_root || '';
-        if (claimedStateRoot && claimedStateRoot !== actualStateRoot) {
-          log('warn', `state_root mismatch at #${height}`);
-          throw new Error('state_root mismatch');
+        if (!isLocalForge && !skipContractStateValidation && this.contracts && bloco.contract_state_root) {
+          const actualCsr = computeContractStateRoot(this.db);
+          if (actualCsr !== bloco.contract_state_root) {
+            log('warn', `contract_state_root mismatch at #${height}: local=${actualCsr.slice(0, 16)} claimed=${bloco.contract_state_root.slice(0, 16)}`);
+            throw new Error('contract_state_root mismatch');
+          }
         }
-      }
-      this._selectTip();
-    });
-    try {
-      tx();
+        this._selectTip();
+      })();
       if (height > 0) log('info', `Block #${height} accepted [${bloco.hash.slice(0, 10)}] from ${blockOrigin} (miner: ${(bloco.miner || '').slice(0, 10)}…)`);
       return { ok: true, motivo: 'block added', height, hash: bloco.hash };
-    } catch (e) { return { ok: false, motivo: e.message || 'database error' }; }
+    } catch (e) {
+      if (contractExec) { try { contractExec.rollback(); } catch {} }
+      return { ok: false, motivo: e.message || 'database error' };
+    }
   }
+
+  _isCreateTx(tx) { return !!(tx && !tx.to_addr && tx.data); }
+
+  _isContractCall(tx) {
+    if (!tx || !tx.to_addr || !tx.data) return false;
+    if (!this.contracts) return false;
+    return !!this.db.prepare('SELECT 1 FROM smart_contracts WHERE lower(address) = lower(?)').get(tx.to_addr);
+  }
+
+  _isContractOp(tx) { return this._isCreateTx(tx) || this._isContractCall(tx); }
+
+  _blockContext(bloco) {
+    try {
+      const b = new Block();
+      const ts = new BN(safeInt(bloco.timestamp, 0)).toString(16, 16).padStart(16, '0');
+      b.header.timestamp = Buffer.from(ts, 'hex');
+      const num = new BN(safeInt(bloco.height, 0)).toString(16, 16).padStart(16, '0');
+      b.header.number = Buffer.from(num, 'hex');
+      return b;
+    } catch (e) { return undefined; }
+  }
+
+  _snapshotContractState(address) {
+    return {
+      address,
+      storage: this.db.prepare('SELECT * FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').all(address),
+      account: this.db.prepare('SELECT * FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(address) || null,
+      contract: this.db.prepare('SELECT * FROM smart_contracts WHERE lower(address) = lower(?)').get(address) || null,
+    };
+  }
+
+  _restoreContractState(snaps) {
+    for (const s of snaps) {
+      this.db.prepare('DELETE FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').run(s.address);
+      this.db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(s.address);
+      this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(s.address);
+      for (const row of s.storage) this.db.prepare('INSERT OR REPLACE INTO smart_contract_storage (contract_address, slot, value) VALUES (?,?,?)').run(row.contract_address, row.slot, row.value);
+      if (s.account) this.db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?,?)').run(s.account.address, s.account.balance);
+      if (s.contract) this.db.prepare('INSERT OR REPLACE INTO smart_contracts (address, creator, code, created_at, updated_at) VALUES (?,?,?,?,?)').run(s.contract.address, s.contract.creator, s.contract.code, s.contract.created_at, s.contract.updated_at);
+    }
+    // a trie do VM é cacheada por processo; após rollback as linhas no DB foram restauradas,
+    // mas o estado em memória pode reter slots stale — descarta o cache para a próxima execução
+    // recarregar do DB de forma determinística.
+    if (this.contracts && this.contracts.clearVmCache) this.contracts.clearVmCache();
+  }
+
+  // Executa txs de contrato (create/call) na ordem do bloco, com contexto de bloco
+  // (timestamp/height) para determinismo. Txs que revertem são marcadas como falhas —
+  // o remetente ainda paga a fee e o nonce avança, mas o valor não é transferido.
+  async _preExecuteContracts(bloco, txs) {
+    const backup = [];
+    const blkCtx = this._blockContext(bloco);
+    try {
+      for (const tx of txs) {
+        const txHash = tx.hash || hashTransaction(tx);
+        if (this.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(txHash)) {
+          tx._ccApplied = true;
+          continue;
+        }
+        if (this._isCreateTx(tx)) {
+          const nonce = safeInt(tx.nonce, 0);
+          const address = this.contracts.deriveContractAddress(tx.from_addr, nonce);
+          backup.push(this._snapshotContractState(address));
+          try {
+            await this.contracts.CreateSmartContract(
+              tx.data,
+              blkCtx,
+              tx.from_addr,
+              nonce,
+              safeBigInt(tx.value, 0n).toString(),
+              tx.gas_limit,
+              tx.gas_price
+            );
+            tx._ccApplied = true;
+          } catch (e) {
+            tx._ccError = e.message || String(e);
+            tx._ccApplied = false;
+          }
+        } else if (this._isContractCall(tx)) {
+          const to = tx.to_addr;
+          backup.push(this._snapshotContractState(to));
+          try {
+            await this.contracts.runSmartContract(to, tx.from_addr, tx.data || '0x', safeBigInt(tx.value, 0n).toString(), tx.gas_limit, tx.gas_price, blkCtx);
+            if (safeBigInt(tx.value, 0n) > 0n) {
+              await this.contracts.creditContractBalance(to, safeBigInt(tx.value, 0n).toString());
+            }
+            tx._ccApplied = true;
+          } catch (e) {
+            tx._ccError = e.message || String(e);
+            tx._ccApplied = false;
+          }
+        }
+      }
+      return { ok: true, rollback: () => this._restoreContractState(backup) };
+    } catch (e) {
+      this._restoreContractState(backup);
+      return { ok: false, motivo: e.message || 'contract execution error', rollback: () => {} };
+    }
+  }
+
 
   _validateTxOrder(txs) {
     const projectedNonce = {}, projectedBalance = {};
@@ -341,7 +534,10 @@ class Chain {
   if (tx.from_addr) tx.from_addr = normalizeAddr(tx.from_addr);
   if (tx.to_addr) tx.to_addr = normalizeAddr(tx.to_addr);
   const sender = tx.from_addr;
-  if (!sender || !tx.to_addr) return { ok: false, motivo: 'missing from_addr/to_addr' };
+  if (!sender) return { ok: false, motivo: 'missing from_addr' };
+  if (!tx.to_addr && !tx.data) return { ok: false, motivo: 'missing to_addr (or data for contract creation)' };
+  if (tx.to_addr && !/^0x[0-9a-fA-F]{42}$/.test(tx.to_addr)) return { ok: false, motivo: 'invalid to_addr' };
+  if (tx.data && !/^0x[0-9a-fA-F]*$/.test(tx.data)) return { ok: false, motivo: 'invalid data' };
   if (safeInt(tx.nonce, -1) < 0 || safeInt(tx.value, -1) < 0) return { ok: false, motivo: 'invalid nonce/value' };
   const sig = tx.signature || '';
   if (!sig) return { ok: false, motivo: `missing signature from ${sender}` };
@@ -353,6 +549,12 @@ class Chain {
   const curBalance = user ? safeBigInt(user.balance, 0n) : 0n;
   if (safeInt(tx.nonce, 0) < curNonce) return { ok: false, motivo: `stale nonce (tx=${tx.nonce}, account=${curNonce})` };
   if (curBalance < safeBigInt(tx.value, 0n) + safeBigInt(tx.fee, 0n)) return { ok: false, motivo: `insufficient balance for ${sender}` };
+  if (!tx.to_addr && this.contracts) {
+    const address = this.contracts.deriveContractAddress(sender, safeInt(tx.nonce, 0));
+    if (this.db.prepare('SELECT 1 FROM smart_contracts WHERE lower(address) = lower(?)').get(address)) {
+      return { ok: false, motivo: `contract already exists at ${address}` };
+    }
+  }
 
   // gas
   const requiredGas = estimateIntrinsicGas(tx);
@@ -400,7 +602,7 @@ class Chain {
     return Math.max(600, Math.min(86400, Math.floor(expected * 36000 / Math.max(capacity, 1))));
   }
 
-  reorganize(targetOrHash, forceSync) {
+  async reorganize(targetOrHash, forceSync) {
     const target = typeof targetOrHash === 'string' ? this.getBlockByHash(targetOrHash) : targetOrHash;
     if (!target) return { ok: false, motivo: 'target block not found' };
     if (target.height >= this.altura && this.getBlock(target.height) && this.getBlock(target.height).hash === target.hash) {
@@ -436,11 +638,15 @@ class Chain {
         if (h === target.hash) blk = target;
         else return { ok: false, motivo: `block ${h} not in DB` };
       }
-      this._insertBlockDirect(blk);
+      const res = await this._insertBlockDirect(blk);
+      if (!res.ok) return { ok: false, motivo: res.motivo };
     }
     this._selectTip();
     this._purgeOrphanedDescendants(forkPoint.height, target.height);
     this._recomputeBalances();
+    // _purgeOrphanedBlocks was previously defined but never invoked anywhere, so stale
+    // side-chain blocks left behind by reorgs accumulated in the DB indefinitely. Run it
+    // here as a final sweep now that the new tip is selected and balances are correct.
     this._purgeOrphanedBlocks();
     log('info', `Reorg to #${this.altura} ${this.melhorHash.slice(0, 10)} (depth ${depth})`);
     return { ok: true, motivo: 'reorganized', height: this.altura, hash: this.melhorHash };
@@ -507,7 +713,9 @@ class Chain {
           bal[tx.from_addr] = (bal[tx.from_addr] || 0n) - BigInt(tx.value || 0) - BigInt(tx.fee || 0);
           nonces[tx.from_addr] = Math.max(nonces[tx.from_addr] || 0, safeInt(tx.nonce, 0) + 1);
         }
-        if (tx.to_addr) bal[tx.to_addr] = (bal[tx.to_addr] || 0n) + BigInt(tx.value || 0);
+        if (tx.to_addr && !this.db.prepare('SELECT 1 FROM smart_contracts WHERE lower(address) = lower(?)').get(tx.to_addr)) {
+          bal[tx.to_addr] = (bal[tx.to_addr] || 0n) + BigInt(tx.value || 0);
+        }
       }
     }
     const now = Math.floor(Date.now() / 1000);
@@ -528,27 +736,52 @@ class Chain {
     }
   }
 
-  _insertBlockDirect(blk) {
+  async _insertBlockDirect(blk) {
     const parentWork = blk.height > 0 ? (() => { const p = this.db.prepare('SELECT chain_work FROM blocks WHERE hash = ?').get(blk.parent_hash); return p ? safeBigInt(p.chain_work, 0n) : 0n; })() : 0n;
     const work = blk.chain_work || String(parentWork + this._blockWork(blk));
     const now = Math.floor(Date.now() / 1000);
-    this.db.prepare(`INSERT OR REPLACE INTO blocks (height, hash, parent_hash, timestamp, miner, challenge_id, tx_root, nonce, difficulty, target,
-      reward_units, reward_cc, tx_count, chain_work, signature, generation_signature, proof_digest, plot_id, state_root, origin,
-      total_fees_units, gas_used, gas_limit, base_target) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      blk.height, blk.hash, blk.parent_hash || '', blk.timestamp || now, blk.miner || '',
-      blk.challenge_id || '', blk.tx_root || '', String(blk.nonce || '0'), blk.difficulty || '0',
-      String(blk.target || '0'), blk.reward_units || '0', blk.reward_cc || '0', blk.tx_count || 0,
-      String(work), blk.signature || '', blk.generation_signature || ZERO_HASH,
-      blk.proof_digest || '', blk.plot_id || '', blk.state_root || '', blk.origin || 'reorg',
-      blk.total_fees_units || '0', blk.gas_used || 0, blk.gas_limit || 30000000, blk.base_target || String(BigInt(2) ** BigInt(64) / BigInt(5898240))
-    );
-    if (blk.miner && blk.miner !== 'genesis' && blk.height > 0) {
-      const reward = BigInt(blk.reward_cc || '0');
-      if (reward > 0n) {
-        const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(blk.miner);
-        if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) + reward), now, blk.miner);
-        else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(blk.miner, String(reward), 0, now, now);
+    const txs = blk.transactions || [];
+    const contractTxs = txs.filter(t => this._isContractOp(t));
+    let contractExec = null;
+    if (contractTxs.length) {
+      if (!this.contracts) return { ok: false, motivo: 'contract txs but smart contracts disabled' };
+      contractExec = await this._preExecuteContracts(blk, txs);
+      if (!contractExec.ok) {
+        contractExec.rollback();
+        return { ok: false, motivo: contractExec.motivo };
       }
+    }
+    try {
+      this.db.transaction(() => {
+        this.db.prepare(`INSERT OR REPLACE INTO blocks (height, hash, parent_hash, timestamp, miner, challenge_id, tx_root, nonce, difficulty, target,
+          reward_units, reward_cc, tx_count, chain_work, signature, generation_signature, proof_digest, plot_id, state_root, origin,
+          total_fees_units, gas_used, gas_limit, base_target, contract_state_root) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          blk.height, blk.hash, blk.parent_hash || '', blk.timestamp || now, blk.miner || '',
+          blk.challenge_id || '', blk.tx_root || '', String(blk.nonce || '0'), blk.difficulty || '0',
+          String(blk.target || '0'), blk.reward_units || '0', blk.reward_cc || '0', blk.tx_count || 0,
+          String(work), blk.signature || '', blk.generation_signature || ZERO_HASH,
+          blk.proof_digest || '', blk.plot_id || '', blk.state_root || '', blk.origin || 'reorg',
+          blk.total_fees_units || '0', blk.gas_used || 0, blk.gas_limit || 30000000, blk.base_target || String(BigInt(2) ** BigInt(64) / BigInt(5898240)),
+          blk.contract_state_root || ''
+        );
+        for (const tx of txs) {
+          const txHash = tx.hash || hashTransaction(tx);
+          if (this.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(txHash)) continue;
+          this.db.prepare('INSERT OR IGNORE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', blk.height, tx.timestamp || now, blk.hash, String(tx.data || ''));
+        }
+        if (blk.miner && blk.miner !== 'genesis' && blk.height > 0) {
+          const reward = BigInt(blk.reward_cc || '0');
+          if (reward > 0n) {
+            const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(blk.miner);
+            if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) + reward), now, blk.miner);
+            else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(blk.miner, String(reward), 0, now, now);
+          }
+        }
+      })();
+      return { ok: true };
+    } catch (e) {
+      if (contractExec) { try { contractExec.rollback(); } catch {} }
+      return { ok: false, motivo: e.message || 'database error' };
     }
   }
 

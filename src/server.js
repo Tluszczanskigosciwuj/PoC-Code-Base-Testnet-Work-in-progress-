@@ -7,7 +7,7 @@ const { createPlotFile } = require('./plot');
 
 
 class Server {
-  constructor(cfg, db, chain, peers, sync, miner, challengeMgr, registry, NODE_ID) {
+  constructor(cfg, db, chain, peers, sync, miner, challengeMgr, registry, NODE_ID, smartContracts = null) {
     this.cfg = cfg;
     this.db = db;
     this.chain = chain;
@@ -17,6 +17,7 @@ class Server {
     this.challengeMgr = challengeMgr;
     this.registry = registry;
     this.NODE_ID = NODE_ID;
+    this.smartContracts = smartContracts;
     this.app = null;
     this.server = null;
     this.discoveryServer = null;
@@ -148,7 +149,7 @@ class Server {
 
     app.post('/api/mempool', (req, res) => {
       const tx = req.body;
-      if (!tx || !tx.from_addr || !tx.to_addr) return res.status(400).json({ error: 'invalid transaction' });
+      if (!tx || !tx.from_addr || (!tx.to_addr && !tx.data)) return res.status(400).json({ error: 'invalid transaction' });
       const validation = this.chain.validateTxForMempool(tx);
       if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
       if (!tx.hash) tx.hash = hashTransaction(tx);
@@ -159,10 +160,11 @@ class Server {
 
     app.post('/api/wallet/sign-and-send', (req, res) => {
       try {
-        const { private_key, to_addr, amount } = req.body;
-        if (!private_key || !to_addr || !amount) return res.status(400).json({ error: 'private_key, to_addr, amount required' });
-        const amountNum = Number(amount);
-        if (isNaN(amountNum) || amountNum <= 0) return res.status(400).json({ error: 'invalid amount' });
+        const { private_key, to_addr, amount, data } = req.body;
+        if (!private_key || (!to_addr && !data)) return res.status(400).json({ error: 'private_key and to_addr (or data for contract creation) required' });
+        const hasData = !!(data && /^0x[0-9a-fA-F]*$/.test(String(data)));
+        const amountNum = amount === undefined || amount === null ? 0 : Number(amount);
+        if (isNaN(amountNum) || amountNum < 0) return res.status(400).json({ error: 'invalid amount' });
         const valueWei = String(Math.round(amountNum * 1e18));
         const key = Buffer.from(private_key, 'hex');
         const prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
@@ -176,9 +178,13 @@ class Server {
         this.db.prepare('DELETE FROM users WHERE public_key_ed25519 = ? AND lower(address) != lower(?)').run(pubB64, from_addr);
         this.db.prepare('INSERT INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_ed25519 = excluded.public_key_ed25519, updated_at = excluded.updated_at').run(from_addr, pubB64, now, now);
         const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(from_addr);
-        const nonce = user ? (user.nonce || 0) + 1 : 1;
-        const gasPrice = this.chain._baseFeeForHeight(this.chain.altura + 1);
-        const tx = { from_addr, to_addr, value: valueWei, nonce, fee: '21000', gas_limit: 21000, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: '0' };
+        const nonce = user ? (user.nonce || 0) : 0;
+        const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.altura + 1);
+        const defaultGas = hasData ? 3000000 : 21000;
+        const gasLimit = req.body.gas_limit || defaultGas;
+        const fee = req.body.fee || (gasLimit === 21000 ? '21000' : String(gasLimit));
+        const tx = { from_addr, to_addr: to_addr || '', value: valueWei, nonce, fee, gas_limit: gasLimit, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0' };
+        if (hasData) tx.data = String(data);
         const msg = canonicalTxMessage(tx);
         tx.signature = signMessage(msg, private_key);
         tx.hash = hashTransaction(tx);
@@ -296,9 +302,12 @@ class Server {
     });
 
     app.post('/api/mining/submit-proof', (req, res) => {
-      const { challenge_id, miner, plot_id, deadline, proof_packet } = req.body;
+      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
-      const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), proof_packet);
+      // Merge proof_signature into proof_packet so submitProof() can verify it
+      const packet = proof_packet || {};
+      if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       if (!result.ok) return res.status(400).json({ error: result.motivo });
       log('info', `[MINERS] Proof submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
       if (result.bloco && this.sync) {
@@ -344,11 +353,109 @@ class Server {
       res.json({ ok: true, plot_id, miner });
     });
 
+    const contractsEnabled = () => !!this.cfg.smartContractsEnabled && this.smartContracts;
+    const contractsDisabled = (res) => res.status(503).json({ error: 'smart contracts disabled on this node', enabled: false });
+
+    // Lista contratos deployados
+    app.get('/api/contracts', (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      res.json({ contracts: this.smartContracts.listSmartContracts() });
+    });
+
+    // Info de um contrato
+    app.get('/api/contracts/:address', (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      const c = this.smartContracts.getSmartContract(req.params.address);
+      if (!c) return res.status(404).json({ error: 'contract not found' });
+      res.json({ contract: c });
+    });
+
+    app.post('/api/contracts/deploy', async (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      const { code, sender, nonce } = req.body || {};
+      if (!code || !sender) return res.status(400).json({ error: 'code and sender required' });
+      try {
+        const result = await this.smartContracts.CreateSmartContract(code, {}, sender, Number(nonce) || 0);
+        res.json({ ...result, contractAddress: result.contractAddress });
+        log('info', `[SMART CONTRACTS] Deployed contract: sender=${sender}, address=${result.contractAddress}, gasUsed=${result.gasUsed}`);
+      } catch (e) {
+        res.status(400).json({ error: e.code || 'CREATE_FAILED', message: e.message });
+      }
+    });
+
+    app.post('/api/contracts/:address/snapshot', async (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      try {
+        const result = await this.smartContracts.SaveSmartContractState(req.params.address);
+        res.json({ ok: true, ...result });
+        log('info', `[SMART CONTRACTS] Saved snapshot for contract: address=${req.params.address}`);
+      } catch (e) {
+        res.status(400).json({ error: e.code || 'SNAPSHOT_FAILED', message: e.message });
+      }
+    });
+
+    // Chamada de contrato (data = calldata ABI)
+    app.post('/api/contracts/call', async (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      const { address, sender, data, value } = req.body || {};
+      if (!address || !sender) return res.status(400).json({ error: 'address and sender required' });
+      try {
+        const result = await this.smartContracts.runSmartContract(address, sender, data || '0x', Number(value) || 0);
+        res.json({ ok: true, returnValue: result.returnValue, gasUsed: result.gasUsed });
+        log('info', `[SMART CONTRACTS] Called contract: address=${address}, sender=${sender}, gasUsed=${result.gasUsed}`);
+      } catch (e) {
+        log('error', `[SMART CONTRACTS] Failed to call contract: address=${address}, sender=${sender}, error=${e.message}`);
+        res.status(400).json({ error: e.code || 'CALL_FAILED', message: e.message });
+      }
+    });
+
+    // Execucao generica de smart contract (qualquer moeda/contrato).
+    // - Sem private_key: executa localmente (leitura/view) e retorna returnValue.
+    // - Com private_key: assina e envia tx minerada (escrita) ao contrato, retornando o hash.
+    app.post('/api/contracts/execute', async (req, res) => {
+      if (!contractsEnabled()) return contractsDisabled(res);
+      try {
+        const { address, sender, data, value, private_key } = req.body || {};
+        if (!address) return res.status(400).json({ error: 'address required' });
+        const calldata = data || '0x';
+        if (!private_key) {
+          const execSender = sender || this.cfg.minerAddress;
+          const result = await this.smartContracts.runSmartContract(address, execSender, calldata, Number(value) || 0);
+          return res.json({ ok: true, mode: 'read', returnValue: result.returnValue, gasUsed: result.gasUsed });
+        }
+        const pkHex = String(private_key).startsWith('0x') ? String(private_key).slice(2) : String(private_key);
+        const key = Buffer.from(pkHex, 'hex');
+        const prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
+        const privKeyObj = crypto2.createPrivateKey({ key: Buffer.concat([prefix, key]), format: 'der', type: 'pkcs8' });
+        const pubKeyObj = crypto2.createPublicKey(privKeyObj);
+        const pubB64 = pubKeyObj.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64');
+        const from_addr = sender || pubkeyToAddress(pubB64);
+        const now = Math.floor(Date.now() / 1000);
+        this.db.prepare('INSERT INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_ed25519 = excluded.public_key_ed25519, updated_at = excluded.updated_at').run(from_addr, pubB64, now, now);
+        const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(from_addr);
+        const nonce = user ? (user.nonce || 0) : 0;
+        const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.altura + 1);
+        const gasLimit = req.body.gas_limit || 3000000;
+        const tx = { from_addr, to_addr: address, value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce, fee: req.body.fee || String(gasLimit), gas_limit: gasLimit, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0', data: calldata };
+        const msg = canonicalTxMessage(tx);
+        tx.signature = signMessage(msg, pkHex);
+        tx.hash = hashTransaction(tx);
+        const validation = this.chain.validateTxForMempool(tx);
+        if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
+        const result = this.chain.addMempoolTx(tx);
+        if (result.ok) setImmediate(() => this.sync.broadcastTx(tx));
+        res.json({ ok: true, mode: 'tx', hash: tx.hash, from: from_addr });
+        log('info', `[SMART CONTRACTS] Executed contract tx: address=${address}, sender=${from_addr}, tx=${tx.hash}`);
+      } catch (e) {
+        res.status(400).json({ error: e.code || 'EXECUTE_FAILED', message: e.message });
+      }
+    });
+
     app.post('/api/stake', (req, res) => {
       const { amount, address } = req.body;
       if (!amount || !address) return res.status(400).json({ error: 'amount and address required' });
       res.json({ ok: true, amount: String(amount), address, stakeId: 'stake_' + Date.now() });
-      console.log(`Received stake request: amount=${amount}, address=${address}`);
+      log('info', `[STAKE] Received stake request: amount=${amount}, address=${address}`);
     });
 
     app.post('/api/node/settings', (req, res) => {
@@ -365,10 +472,10 @@ class Server {
     };
     app.get('/api/logs', requireAdmin, (req, res) => res.json({ logs: getLogBuffer() }));
 
-    app.post('/api/node/broadcast/block', (req, res) => {
+    app.post('/api/node/broadcast/block', async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
-      const result = this.chain.addBlock(block, { skipPocValidation: true, skipSignature: true, skipTargetValidation: true, skipStateValidation: true, skipHashValidation: true, forceSync: true });
+      const result = await this.chain.addBlock(block, { skipPocValidation: true, skipSignature: true, skipTargetValidation: true, skipStateValidation: true, skipHashValidation: true, forceSync: true });
       log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} altura=${this.chain.altura}`);
       res.json(result);
     });
@@ -392,7 +499,7 @@ class Server {
       if (!url) return res.status(400).json({ error: 'url required' });
       this.peers.add(url);
       this.peers.seen(url, safeInt(req.body.height, 0), req.body.node_id);
-      console.log(`Node announce: url=${url}, height=${req.body.height}, node_id=${req.body.node_id}`);
+      log('info', `[P2P] Node announce: url=${url}, height=${req.body.height}, node_id=${req.body.node_id}`);
       res.json({ ok: true, our_height: this.chain.altura, node_id: this.NODE_ID, peers: this.peers.gossipPeers(10) });
     });
 
@@ -413,9 +520,11 @@ class Server {
     });
 
     app.post('/api/challenge/submit', (req, res) => {
-      const { challenge_id, miner, plot_id, deadline, proof_packet } = req.body;
+      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
-      const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), proof_packet);
+      const packet = proof_packet || {};
+      if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       log('info', `[MINERS] Challenge submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
       res.json(result);
     });
@@ -436,10 +545,10 @@ class Server {
     });
     app.delete('/api/plots/:id', (req, res) => { this.db.prepare('DELETE FROM plot_commitments WHERE plot_id = ?').run(req.params.id); res.json({ ok: true }); });
 
-    app.post('/api/node/forge', (req, res) => {
+    app.post('/api/node/forge', async (req, res) => {
       const challenge = this.challengeMgr.getOrCreate();
       if (!challenge) return res.status(400).json({ error: 'no challenge' });
-      this.challengeMgr._forgeBlockForChallenge(this.chain, this.sync, challenge);
+      await this.challengeMgr._forgeBlockForChallenge(this.chain, this.sync, challenge);
       log('info', `[P2P] Forge block request: challenge_id=${challenge.challenge_id}, height=${this.chain.altura}`);
       res.json({ ok: true });
     });

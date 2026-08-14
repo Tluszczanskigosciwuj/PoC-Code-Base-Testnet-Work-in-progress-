@@ -3,7 +3,8 @@ const path = require('path');
 const { URL } = require('url');
 
 const BASE_DIR = __dirname + '/..';
-// load env
+
+// Load config.env if present
 try {
   const envPath = path.join(BASE_DIR, 'config.env');
   if (fs.existsSync(envPath)) {
@@ -77,6 +78,8 @@ function loadConfig() {
     upnpEnabled: true,
     discoveryUrl: '',
     discoveryPort: 7777,
+    smartContractsEnabled: false,
+    optionalModulesAsked: false,
   };
 
   if (fs.existsSync(CONFIG_PATH)) {
@@ -114,6 +117,7 @@ function loadConfig() {
   defaults.minGasPrice = envInt('MIN_GAS_PRICE', defaults.minGasPrice);
   defaults.targetGasPerBlock = envInt('TARGET_GAS_PER_BLOCK', defaults.targetGasPerBlock);
   defaults.maxGasPerBlock = envInt('MAX_GAS_PER_BLOCK', defaults.maxGasPerBlock);
+  defaults.smartContractsEnabled = envBool('SMART_CONTRACTS_ENABLED', defaults.smartContractsEnabled);
 
   return defaults;
 }

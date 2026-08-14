@@ -111,7 +111,8 @@ class SyncEngine {
             continue;
           }
           block._from_local_forge = false;
-          this.chain._insertBlockDirect(block);
+          const insertResult = await this.chain._insertBlockDirect(block);
+          if (!insertResult.ok) { log('debug', `sync: block insert rejected at #${block.height}: ${insertResult.motivo}`); break; }
           inserted++;
           from = block.height + 1;
           advanced = true;
@@ -125,7 +126,7 @@ class SyncEngine {
       this.chain._purgeOrphanedBlocks();
       const peerTip = await fetchJSON(`${peerUrl}/api/block/${remoteHeight}`, { timeout: 5 });
       if (peerTip && peerTip.hash) {
-        const reorgResult = this.chain.reorganize(peerTip, true);
+        const reorgResult = await this.chain.reorganize(peerTip, true);
         if (reorgResult.ok) {
           log('info', `Synced ${inserted} blocks from ${peerUrl}, reorged to #${reorgResult.height} ${(reorgResult.hash || '').slice(0, 10)}`);
         } else {
