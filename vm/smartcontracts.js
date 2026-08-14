@@ -1,8 +1,28 @@
 const { GAS_PARAMS } = require('../consensus/gas');
 const VM = require('ethereumjs-vm').default;
 const BN = require('bn.js');
-const { generateAddress, toChecksumAddress } = require('ethereumjs-util');
+const { generateAddress, toChecksumAddress, toBuffer } = require('ethereumjs-util');
 const rlp = require('rlp');
+
+patchLevelWsDoubleClose();
+
+function patchLevelWsDoubleClose() {
+  try {
+    const { WriteStream } = require('level-ws');
+    if (!WriteStream || WriteStream.prototype.__ccPatched) return;
+    WriteStream.prototype.__ccPatched = true;
+    const originalEmit = WriteStream.prototype.emit;
+    WriteStream.prototype.emit = function (eventName, ...args) {
+      if (eventName === 'close') {
+        if (this.__ccCloseFired) return this;
+        this.__ccCloseFired = true;
+      }
+      return originalEmit.call(this, eventName, ...args);
+    };
+  } catch (e) {
+    // noop
+  }
+}
 
 const initialSmartContractGasLimit = GAS_PARAMS.initialSmartContractGasLimit;
 const initialSmartContractGasPrice = GAS_PARAMS.initialSmartContractGasPrice;
@@ -20,6 +40,11 @@ function setDatabase(database) {
   db = database;
 }
 
+function clearVmCache() {
+  vmCache.clear();
+  knownSlots.clear();
+}
+
 function getVm(contractAddress) {
   const key = normalizeHex(contractAddress);
   if (!vmCache.has(key)) {
@@ -29,6 +54,31 @@ function getVm(contractAddress) {
     knownSlots.set(key, new Set());
   }
   return vmCache.get(key);
+}
+
+async function restoreContractBalance(vm, evmAddr, contractAddress) {
+  const row = db.prepare('SELECT balance FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(contractAddress);
+  const account = await new Promise((resolve, reject) => {
+    vm.stateManager.getAccount(evmAddr, (err, acc) => (err ? reject(err) : resolve(acc)));
+  });
+  account.balance = toBuffer(new BN(row ? row.balance : 0));
+  await new Promise((resolve, reject) => {
+    vm.stateManager.putAccount(evmAddr, account, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+async function flushContractBalance(vm, contractAddress) {
+  if (!db) return;
+  const evmAddr = toEvmAddress(contractAddress);
+  const account = await new Promise((resolve, reject) => {
+    vm.stateManager.getAccount(evmAddr, (err, acc) => (err ? reject(err) : resolve(acc)));
+  });
+  const balance = new BN(account.balance);
+  if (balance.isZero()) {
+    db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(contractAddress);
+  } else {
+    db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?, ?)').run(contractAddress.toLowerCase(), balance.toString());
+  }
 }
 
 async function loadContractStorage(vm, contractAddress) {
@@ -45,6 +95,7 @@ async function loadContractStorage(vm, contractAddress) {
     slots.add(row.slot);
   }
   knownSlots.set(normalizeHex(contractAddress), slots);
+  await restoreContractBalance(vm, evmAddr, contractAddress);
 }
 
 async function saveContractStorage(vm, contractAddress, writtenSlots) {
@@ -94,6 +145,7 @@ async function SaveSmartContractState(contractAddress) {
   }
   db.prepare('UPDATE smart_contracts SET updated_at = ? WHERE lower(address) = lower(?)')
     .run(Math.floor(Date.now() / 1000), contractAddress);
+  await flushContractBalance(vm, contractAddress);
   return { saved };
 }
 
@@ -109,6 +161,7 @@ async function runWithStorage(vm, contractAddress, params) {
     const result = await vm.runCode(params);
     if (!result.exceptionError) {
       await saveContractStorage(vm, contractAddress, writtenSlots);
+      await flushContractBalance(vm, contractAddress);
     }
     return result;
   } finally {
@@ -155,10 +208,27 @@ function deriveContractAddress(senderAddress, nonce) {
   return '0xcc' + contractBuf.toString('hex');
 }
 
+function decodeRevertReason(returnValue) {
+  try {
+    const buf = Buffer.isBuffer(returnValue) ? returnValue : Buffer.from(normalizeHex(returnValue || ''), 'hex');
+    if (buf.length < 68 || buf.slice(0, 4).toString('hex') !== '08c379a0') return null;
+    const length = new BN(buf.slice(36, 68)).toNumber();
+    return buf.slice(68, 68 + length).toString('utf8');
+  } catch (e) {
+    return null;
+  }
+}
+
 function parseResult(result) {
   if (result.exceptionError) {
-    const err = new Error(`contract reverted: ${result.exceptionError.error || result.exceptionError}`);
+    const reason = decodeRevertReason(result.returnValue);
+    const err = new Error(
+      reason
+        ? `contract reverted: ${reason}`
+        : `contract reverted: ${result.exceptionError.error || result.exceptionError}`
+    );
     err.code = 'VM_REVERT';
+    if (reason) err.reason = reason;
     throw err;
   }
   return {
@@ -166,6 +236,34 @@ function parseResult(result) {
     gasUsed: result.gasUsed.toString(),
     logs: result.logs || [],
   };
+}
+
+async function creditContractValue(vm, contractAddress, senderAddress, value) {
+  const amount = new BN(value || 0);
+  if (amount.isZero()) return;
+  const evmAddr = toEvmAddress(contractAddress);
+  const account = await new Promise((resolve, reject) => {
+    vm.stateManager.getAccount(evmAddr, (err, acc) => (err ? reject(err) : resolve(acc)));
+  });
+  account.balance = toBuffer(new BN(account.balance).add(amount));
+  await new Promise((resolve, reject) => {
+    vm.stateManager.putAccount(evmAddr, account, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+// Credita `value` no saldo (account balance) de um contrato de forma determinística:
+// restaura o estado do DB, credita na trie do VM e persiste o novo balance. Usado pelo
+// caminho de consenso (addBlock) para txs de chamada com valor, mantendo o balance do
+// contrato capturado no contract_state_root.
+async function creditContractBalance(contractAddress, value) {
+  assertValidAddress(contractAddress, 'contractAddress');
+  const amount = new BN(value || 0);
+  if (amount.isZero()) return { credited: 0 };
+  const vm = getVm(contractAddress);
+  await loadContractStorage(vm, contractAddress);
+  await creditContractValue(vm, contractAddress, null, amount);
+  await flushContractBalance(vm, contractAddress);
+  return { credited: 1 };
 }
 
 async function CreateSmartContract(code, context, senderAddress, nonce, value = 0, gasLimit, gasPrice) {
@@ -185,6 +283,7 @@ async function CreateSmartContract(code, context, senderAddress, nonce, value = 
   }
 
   const vm = getVm(contractAddress);
+  await creditContractValue(vm, contractAddress, senderAddress, value);
   const result = await runWithStorage(vm, contractAddress, {
     code: Buffer.from(normalizeHex(code), 'hex'),
     gasLimit: new BN(gasLimit || initialSmartContractGasLimit),
@@ -216,7 +315,7 @@ async function CreateSmartContract(code, context, senderAddress, nonce, value = 
   return { ...parseResult(result), contractAddress, runtimeCode: '0x' + runtimeCode };
 }
 
-async function runSmartContract(contractAddress, senderAddress, data = '', value = 0, gasLimit, gasPrice) {
+async function runSmartContract(contractAddress, senderAddress, data = '', value = 0, gasLimit, gasPrice, block) {
   assertValidAddress(contractAddress, 'contractAddress');
   assertValidAddress(senderAddress, 'senderAddress');
   if (typeof data !== 'string' || !/^0x[0-9a-fA-F]*$/.test(data)) {
@@ -233,7 +332,7 @@ async function runSmartContract(contractAddress, senderAddress, data = '', value
   }
 
   const vm = getVm(contractAddress);
-  const result = await runWithStorage(vm, contractAddress, {
+  const params = {
     code: Buffer.from(contract.code, 'hex'),
     gasLimit: new BN(gasLimit || initialSmartContractGasLimit),
     gasPrice: new BN(gasPrice || initialSmartContractGasPrice),
@@ -241,7 +340,9 @@ async function runSmartContract(contractAddress, senderAddress, data = '', value
     caller: toEvmAddress(senderAddress),
     value: new BN(value || 0),
     data: data ? Buffer.from(normalizeHex(data), 'hex') : Buffer.alloc(0),
-  });
+  };
+  if (block) params.block = block;
+  const result = await runWithStorage(vm, contractAddress, params);
 
   return parseResult(result);
 }
@@ -258,8 +359,18 @@ function listSmartContracts() {
   return db.prepare('SELECT * FROM smart_contracts ORDER BY created_at DESC').all();
 }
 
+async function getAccountBalance(address, inVmOfContract) {
+  assertValidAddress(address, 'address');
+  const vm = inVmOfContract ? getVm(inVmOfContract) : getVm(address);
+  const evmAddr = toEvmAddress(address);
+  return new Promise((resolve, reject) => {
+    vm.stateManager.getAccount(evmAddr, (err, acc) => (err ? reject(err) : resolve(new BN(acc.balance))));
+  });
+}
+
 module.exports = {
-  setDatabase, CreateSmartContract, runSmartContract, getSmartContract, listSmartContracts,
+  setDatabase, clearVmCache, CreateSmartContract, runSmartContract, getSmartContract, listSmartContracts,
   SaveSmartContractState, InitialSmartContractGasPriceHumanReadable, deriveContractAddress,
-  toChecksumAddress, toEvmAddress, fromEvmAddress, MAX_CONTRACT_CODE_SIZE,
+  toChecksumAddress, toEvmAddress, fromEvmAddress, MAX_CONTRACT_CODE_SIZE, getAccountBalance,
+  creditContractBalance,
 };
