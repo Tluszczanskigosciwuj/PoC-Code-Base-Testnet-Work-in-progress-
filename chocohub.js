@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+// Backward-compatible entry point — re-exports from src/
 const { ChocoNode, NodeRegistry } = require('./src/node');
 const { loadConfig, saveConfig, normalizeUrl, normalizeSeedPeers, log, setLogLevel, getLogBuffer, BASE_DIR, CONFIG_PATH } = require('./src/config');
 const crypto_utils = require('./src/crypto');
@@ -15,6 +16,7 @@ const plot = require('./src/plot');
 const { DiscoveryServer, connectDiscoveryServer } = require('./src/discovery');
 const { Server } = require('./src/server');
 
+// Re-export everything from crypto
 const {
   ZERO_HASH, sha256hex, safeInt, safeBigInt, pubkeyToAddress, pubKeyToAddress,
   signMessage, verifySignature, merkleRoot, computeMerkleProof, verifyMerkleProof,
@@ -24,6 +26,7 @@ const {
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
 } = crypto_utils;
 
+// Fee helpers
 const GWEI = 10 ** 9;
 const TX_GAS = 21000;
 function computeBaseFee(activeMiners = 1, parentGasUsed, parentGasLimit) {
@@ -42,6 +45,7 @@ const { ChallengeManager, TIERS, TIER_REWARD_PCT, getTier, computeBaseTargetWith
 const { initDB } = db;
 const { buildPocProof, computePlotMerkleRoot, createPlotFile } = plot;
 
+// Self-test
 function main() {
   const cfg = loadConfig();
   setLogLevel(cfg.logLevel);
@@ -49,23 +53,36 @@ function main() {
   node.start();
 }
 
+// Export everything
 module.exports = {
+  // Config
   loadConfig, saveConfig, normalizeUrl, normalizeSeedPeers, log, setLogLevel, getLogBuffer, BASE_DIR, CONFIG_PATH,
+  // Crypto
   ZERO_HASH, sha256hex, safeInt, safeBigInt, pubkeyToAddress, pubKeyToAddress,
   signMessage, verifySignature, merkleRoot, computeMerkleProof, verifyMerkleProof,
   canonicalTxMessage, hashTransaction, hashBlock, blockMessage,
   computeStateRoot, computeStateRootAfterTxs, calculateMiningReward, isBetterChainCandidate,
   SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, plotScoopCount, plotScoopCountOrig,
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
+  // Fees
   GWEI, TX_GAS, computeBaseFee, suggestedGasPrice, computeFee,
+  // Tiers
   TIERS, TIER_REWARD_PCT, getTier, computeBaseTargetWithTier,
+  // Plot
   buildPocProof, computePlotMerkleRoot, createPlotFile,
+  // DB
   initDB,
+  // Discovery
   DiscoveryServer, connectDiscoveryServer,
+  // Chain
   Blockchain: Chain,
+  // Challenge
   ChallengeManager,
+  // Peers
   PeerManager,
+  // Miner
   Miner,
+  // Node
   ChocoNode, NodeRegistry, Server,
 };
 

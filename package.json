@@ -16,9 +16,12 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",
+    "ethereumjs-abi": "^0.6.8",
+    "ethereumjs-vm": "^4.2.0",
     "express": "^5.2.1",
     "helmet": "^8.2.0",
     "localtunnel": "^2.0.2",
+    "solc": "^0.8.28",
     "ws": "^8.21.0"
   }
 }
