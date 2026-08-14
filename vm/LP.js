@@ -6,6 +6,8 @@ const Block = require('ethereumjs-block');
 const Database = require('better-sqlite3');
 const SC = require('./smartcontracts.js');
 
+// THIS IS AN EXAMPLE FILE, ILL UPDATE SOON
+
 const dbPath = require('path').join(__dirname, '..', '..', 'db', 'choco-node.db');
 const db = new Database(dbPath);
 SC.setDatabase(db);
