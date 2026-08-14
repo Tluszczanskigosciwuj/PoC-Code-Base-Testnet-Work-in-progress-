@@ -1,4 +1,4 @@
-// EXAMPLE FILE, PLACE HOLDER
+// EXAMPLE FILE, PLACE HOLDER, WILL EVOLVE TO A REAL DEX HEHE
 
 const solc = require('solc');
 const abi = require('ethereumjs-abi');
