@@ -331,7 +331,11 @@ class Chain {
         // stealing rewards by omitting the distribution array.
         for (const tx of txs) {
           const txHash = tx.hash || hashTransaction(tx);
-          this.db.prepare('INSERT OR IGNORE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash, String(tx.data || ''));
+          // INSERT OR REPLACE (não IGNORE): se a mesma tx foi incluída antes num bloco
+          // orfão/descartado, atualiza block_hash/block_height para o bloco canônico atual.
+          // Sem isso, _attachTransactions (match por block_hash) não acha a tx no bloco
+          // canônico, e peers que syncam o bloco nunca veem txs de contrato.
+          this.db.prepare('INSERT OR REPLACE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash, String(tx.data || ''));
           if (tx.from_addr) {
             const cur = this.db.prepare('SELECT balance, nonce FROM users WHERE address = ?').get(tx.from_addr);
             if (cur) {
@@ -766,8 +770,10 @@ class Chain {
         );
         for (const tx of txs) {
           const txHash = tx.hash || hashTransaction(tx);
-          if (this.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(txHash)) continue;
-          this.db.prepare('INSERT OR IGNORE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', blk.height, tx.timestamp || now, blk.hash, String(tx.data || ''));
+          // INSERT OR REPLACE (não IGNORE): corrige block_hash/block_height quando a tx
+          // já existe apontando para um bloco orfão descartado, para que peers que syncam
+          // o bloco canônico recebam as txs (inclusive txs de contrato).
+          this.db.prepare('INSERT OR REPLACE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', blk.height, tx.timestamp || now, blk.hash, String(tx.data || ''));
         }
         if (blk.miner && blk.miner !== 'genesis' && blk.height > 0) {
           const reward = BigInt(blk.reward_cc || '0');
