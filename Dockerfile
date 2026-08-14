@@ -12,6 +12,7 @@ RUN npm install --production
 COPY src/ ./src/
 COPY chocohub.js ./
 COPY cli.js ./
+COPY config.env ./
 
 EXPOSE 3001
 
