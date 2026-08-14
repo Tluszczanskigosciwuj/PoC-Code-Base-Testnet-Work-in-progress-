@@ -304,7 +304,6 @@ class Server {
     app.post('/api/mining/submit-proof', (req, res) => {
       const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
-      // Merge proof_signature into proof_packet so submitProof() can verify it
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
@@ -355,14 +354,12 @@ class Server {
 
     const contractsEnabled = () => !!this.cfg.smartContractsEnabled && this.smartContracts;
     const contractsDisabled = (res) => res.status(503).json({ error: 'smart contracts disabled on this node', enabled: false });
-
-    // Lista contratos deployados
+    
     app.get('/api/contracts', (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       res.json({ contracts: this.smartContracts.listSmartContracts() });
     });
 
-    // Info de um contrato
     app.get('/api/contracts/:address', (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       const c = this.smartContracts.getSmartContract(req.params.address);
@@ -394,7 +391,6 @@ class Server {
       }
     });
 
-    // Chamada de contrato (data = calldata ABI)
     app.post('/api/contracts/call', async (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       const { address, sender, data, value } = req.body || {};
