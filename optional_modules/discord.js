@@ -2,8 +2,7 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-// Importação segura do log e da configuração
-let log = () => {}; // fallback
+let log = () => {};
 try {
   const configModule = require('../src/config');
   if (configModule && typeof configModule.log === 'function') {
@@ -18,10 +17,8 @@ try {
   // arquivo de configuração opcional
 }
 
-// Obtém o webhook de forma robusta
 const webhookUrl = (config && config.discord_webhook_url) || process.env.discord_webhook_url || null;
 
-// Função auxiliar para enviar requisições ao Discord
 function sendDiscordEmbed(embed) {
   if (!webhookUrl) return;
 
@@ -45,7 +42,6 @@ function sendDiscordEmbed(embed) {
   }
 }
 
-// Função exportada para notificar novo bloco
 function notifyNewBlock(block, cfg) {
   if (!webhookUrl || !block) return;
 
@@ -78,7 +74,6 @@ function notifyNewBlock(block, cfg) {
   sendDiscordEmbed(embed);
 }
 
-// Função exportada para notificar nova prova (AGORA FORA DO ESCOPO)
 function notifyNewProof(miner, plotid, deadline, result) {
   if (!webhookUrl) return;
 
