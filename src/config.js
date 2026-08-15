@@ -53,7 +53,7 @@ function loadConfig() {
     genesisTimestamp: 1735689600,
     maxFutureBlockSec: 120,
     difficultyAdjustBlocks: 8192,
-    expectedTimePerBlock: 10,
+    expectedTimePerBlock: 240,
     initialTarget: '0x00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF',
     initialReward: '1650000000000000000',
     halvingInterval: 6300000,

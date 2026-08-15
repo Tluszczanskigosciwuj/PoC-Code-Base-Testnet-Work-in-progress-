@@ -77,6 +77,7 @@ function initDB(dbPath, cfg) {
       deadline INTEGER, proof_digest TEXT, submitted_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_sub_challenge ON challenge_submissions(challenge_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline);
 
     CREATE TABLE IF NOT EXISTS plot_commitments (
       plot_id TEXT, miner TEXT, merkle_root TEXT, size_gb REAL,
@@ -93,6 +94,16 @@ function initDB(dbPath, cfg) {
       miner TEXT, plot_id TEXT, size_gb REAL, share_pct REAL,
       reward_cc TEXT, created_at INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS block_payouts (
+      block_hash TEXT NOT NULL,
+      height INTEGER,
+      to_addr TEXT NOT NULL,
+      value TEXT,
+      PRIMARY KEY (block_hash, to_addr)
+    );
+    CREATE INDEX IF NOT EXISTS idx_block_payouts_height ON block_payouts(height);
+    CREATE INDEX IF NOT EXISTS idx_block_payouts_to ON block_payouts(to_addr);
 
     CREATE TABLE IF NOT EXISTS plot_cache (
       plot_id TEXT PRIMARY KEY, merkle_root TEXT, size_gb REAL,
@@ -112,10 +123,8 @@ function initDB(dbPath, cfg) {
     );
   `);
 
-  // Migration: add timeout_until to peers if missing
   try { db.prepare('ALTER TABLE peers ADD COLUMN timeout_until INTEGER DEFAULT 0').run(); } catch {}
 
-  // Migration: ensure smart_contracts table exists in pre-existing DBs
   try {
     db.prepare(`
       CREATE TABLE IF NOT EXISTS smart_contracts (
@@ -128,7 +137,9 @@ function initDB(dbPath, cfg) {
     `).run();
   } catch (e) { /* table likely exists */ }
 
-  // Migration: ensure smart_contract_storage table exists in pre-existing DBs
+  try { db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, share_pct, reward_cc)').run(); } catch (e) { /* nothing to clean */ }
+  try { db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, share_pct, reward_cc)').run(); } catch (e) { /* duplicates present, skipped */ }
+
   try {
     db.prepare(`
       CREATE TABLE IF NOT EXISTS smart_contract_storage (
@@ -140,9 +151,6 @@ function initDB(dbPath, cfg) {
     `).run();
   } catch (e) { /* table likely exists */ }
 
-  // Migration: ensure smart_contract_accounts table exists (balances held by contracts).
-  // These are part of the contract state root and are restored into the VM trie before
-  // every deterministic execution so that synced nodes reproduce identical state.
   try {
     db.prepare(`
       CREATE TABLE IF NOT EXISTS smart_contract_accounts (
@@ -152,13 +160,15 @@ function initDB(dbPath, cfg) {
     `).run();
   } catch (e) { /* table likely exists */ }
 
-  // Migration: add proof_signature to challenge_submissions for PoC proof signing
   try { db.prepare('ALTER TABLE challenge_submissions ADD COLUMN proof_signature TEXT DEFAULT ""').run(); } catch {}
 
-  // Migration: add winner_proof JSON to blocks for verified reward distribution
+  try {
+    db.prepare('DELETE FROM challenge_submissions WHERE id NOT IN (SELECT MIN(id) FROM challenge_submissions GROUP BY challenge_id, miner, plot_id, deadline)').run();
+    db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline)').run();
+  } catch (e) { /* duplicates present, skipped */ }
+
   try { db.prepare('ALTER TABLE blocks ADD COLUMN winner_proof TEXT DEFAULT ""').run(); } catch {}
 
-  // Migration: normalize all addresses to lowercase to prevent case-sensitive duplicates
   try {
     const rows = db.prepare('SELECT address, balance, nonce, public_key_ed25519 FROM users WHERE address != lower(address)').all();
     for (const row of rows) {
@@ -176,9 +186,6 @@ function initDB(dbPath, cfg) {
     }
   } catch (e) { /* migration may have already run */ }
 
-  // Must match the standard address format produced by pubkeyToAddress: '0xcc' + 40 hex chars (44 total).
-  // The previous literal ('0xccc' + 43 zeros = 45 chars) didn't match that shape and could fail
-  // any address-format validation (regex length checks, etc.) applied elsewhere in the codebase.
   const treasuryAddress = '0xcc' + '0'.repeat(40);
   const treasuryAmount = safeBigInt(cfg.maxSupply || '21000000000000000000000000', 0n);
   const existing = db.prepare('SELECT balance FROM users WHERE address = ?').get(treasuryAddress);

@@ -74,7 +74,6 @@ class ChallengeManager {
     const leafHash = Buffer.from(proofPacket.scoop_data, 'hex');
     if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, plot.merkle_root)) return { ok: false, motivo: 'Merkle proof does not match committed plot root' };
 
-    // Verify proof signature — proves the submitter controls the claimed miner address
     const proofSig = (proofPacket && proofPacket.proof_signature) || '';
     if (proofSig) {
       const pkRow = this.db.prepare('SELECT public_key_ed25519 FROM users WHERE lower(address) = lower(?)').get(miner);
@@ -84,7 +83,6 @@ class ChallengeManager {
           return { ok: false, motivo: 'proof signature does not match miner address' };
         }
       }
-      // If no public key registered, skip verification (will fail at block validation)
     }
 
     this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now);
@@ -100,9 +98,6 @@ class ChallengeManager {
     return result;
   }
 
-  // Pulls candidate txs from the mempool and drops any that would fail chain._validateTxOrder
-  // (bad signature, stale/out-of-order nonce, insufficient balance) instead of letting a single
-  // bad tx poison the whole block and stall forging forever. Bad txs are removed from the mempool.
   _selectValidMempoolTxs(chain, maxCount) {
     const candidates = chain.getMempoolForBlock(maxCount);
     log('info', `[TX] mempool candidates: ${candidates.length}`);
@@ -188,12 +183,6 @@ class ChallengeManager {
     const nextHeight = chain.altura + 1;
     const existingBlock = this.db.prepare('SELECT hash, challenge_id FROM blocks WHERE height = ? ORDER BY LENGTH(chain_work) DESC, chain_work DESC LIMIT 1').get(nextHeight);
 
-    // A challenge is only still forgeable if it was created against the CURRENT tip lineage.
-    // If chain.altura has moved past (or diverged from) the height the challenge was created
-    // at — e.g. because we synced blocks from a peer in the meantime — the challenge's context
-    // (parent block, generation_signature) is stale. Forging it now would either be rejected
-    // downstream or, worse, produce a burst of blocks in rapid succession once several stale
-    // challenges become "eligible" at once. Mark those as abandoned instead of forging them.
     const stale = this.db.prepare(`SELECT challenge_id, block_height FROM mining_challenges
       WHERE forged_block_height IS NULL AND winner_deadline IS NOT NULL AND winner_miner IS NOT NULL
       AND (finalized_at + winner_deadline) <= ? AND block_height < ?`).all(now, chain.altura);
@@ -217,7 +206,7 @@ class ChallengeManager {
       } else {
         log('info', `Deadline elapsed — forging block for challenge ${ch.challenge_id.slice(0, 12)} (d=${ch.winner_deadline}s)`);
         await this._forgeBlockForChallenge(chain, syncEngine, ch);
-        return; // one block per tick — never burst-forge multiple challenges in the same pass
+        return;
       }
     }
 
@@ -249,7 +238,15 @@ class ChallengeManager {
       const submissions = this.db.prepare('SELECT * FROM challenge_submissions WHERE challenge_id = ? ORDER BY deadline ASC').all(challenge.challenge_id);
       if (!submissions.length) return null;
       const maxDl = chain.computeMaxDeadline();
-      const validSubs = submissions.filter(s => s.deadline <= maxDl);
+      const seenSub = new Set();
+      const validSubs = submissions
+        .filter(s => s.deadline <= maxDl)
+        .filter(s => {
+          const k = `${(s.miner || '').toLowerCase()}:${s.plot_id || ''}:${s.deadline}`;
+          if (seenSub.has(k)) return false;
+          seenSub.add(k);
+          return true;
+        });
       if (!validSubs.length) return null;
       const winner = validSubs[0];
       const localMiner = String(this.cfg.minerAddress || '').toLowerCase();
@@ -287,7 +284,6 @@ class ChallengeManager {
       if (allocated < totalReward && distribution.length > 0) {
         distribution[0].reward_cc = String(BigInt(distribution[0].reward_cc) + (totalReward - allocated));
       }
-      // Build the winner_proof object from the winning submission's stored signature
       const winnerProof = {
         miner: (winner.miner || '').toLowerCase(),
         deadline: winner.deadline,
@@ -296,7 +292,6 @@ class ChallengeManager {
       };
       const block = this._forgeBlock(chain, challenge, winner.miner, winner.deadline, distribution, winner.plot_id || '', winner.proof_digest || '', winnerProof);
       if (!block) return null;
-      // skipSignature removed — block must be validated including winner_proof verification
       const result = await chain.addBlock(block, { skipStateValidation: true, skipPocValidation: true, skipTxValidation: true });
       if (!result.ok) {
         log('error', `Block forge rejected for challenge ${challenge.challenge_id.slice(0, 12)}: ${result.motivo}`);

@@ -203,7 +203,7 @@ function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
   buf.writeUInt32LE(idLow, 16);
   buf.write(minerAddress.padEnd(44, '\0'), 20, 44, 'ascii');
   buf.writeUInt32LE(totalScoops, 64);
-  buf.writeUInt32LE(32, 68); // SCOOP_SIZE = 32 for V3
+  buf.writeUInt32LE(32, 68);
   buf.write(root, 72, 64, 'hex');
   accountId.copy(buf, 104);
 

@@ -304,6 +304,7 @@ class Server {
     app.post('/api/mining/submit-proof', (req, res) => {
       const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
+      // Merge proof_signature into proof_packet so submitProof() can verify it
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
@@ -354,12 +355,14 @@ class Server {
 
     const contractsEnabled = () => !!this.cfg.smartContractsEnabled && this.smartContracts;
     const contractsDisabled = (res) => res.status(503).json({ error: 'smart contracts disabled on this node', enabled: false });
-    
+
+    // Lista contratos deployados
     app.get('/api/contracts', (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       res.json({ contracts: this.smartContracts.listSmartContracts() });
     });
 
+    // Info de um contrato
     app.get('/api/contracts/:address', (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       const c = this.smartContracts.getSmartContract(req.params.address);
@@ -391,6 +394,7 @@ class Server {
       }
     });
 
+    // Chamada de contrato (data = calldata ABI)
     app.post('/api/contracts/call', async (req, res) => {
       if (!contractsEnabled()) return contractsDisabled(res);
       const { address, sender, data, value } = req.body || {};
@@ -471,7 +475,13 @@ class Server {
     app.post('/api/node/broadcast/block', async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
-      const result = await this.chain.addBlock(block, { skipPocValidation: true, skipSignature: true, skipTargetValidation: true, skipStateValidation: true, skipHashValidation: true, forceSync: true });
+      // Blocks that EXTEND the current tip are forged by a real miner; when that miner is
+      // registered locally we can (and must) verify their signature, which authenticates the
+      // block and commits to its full content (rewards, state_root, txs). Backfill/sync of
+      // known heights keeps the relaxed path so history can be pulled from peers.
+      const extendTip = safeInt(block.height, 0) > this.chain.altura;
+      const minerPk = extendTip && block.miner ? this.chain.db.prepare('SELECT 1 FROM users WHERE lower(address) = lower(?) AND public_key_ed25519 IS NOT NULL AND public_key_ed25519 != ""').get(block.miner) : null;
+      const result = await this.chain.addBlock(block, { skipPocValidation: true, skipSignature: !minerPk, skipTargetValidation: true, skipStateValidation: true, skipHashValidation: true, forceSync: true });
       log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} altura=${this.chain.altura}`);
       res.json(result);
     });

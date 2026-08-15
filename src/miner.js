@@ -1,5 +1,5 @@
 const path = require('path');
-const { safeInt, safeBigInt, signMessage, proofMessage } = require('./crypto');
+const { safeInt, safeBigInt, signMessage, proofMessage, verifyMerkleProofBuf } = require('./crypto');
 const { buildPocProof } = require('./plot');
 const { fetchJSON } = require('./sync');
 const { log } = require('./config');
@@ -86,8 +86,14 @@ class Miner {
     for (const plot of plots) {
       const plotPath = path.join(this.cfg.plotsDir, `${plot.plot_id}.plot`);
       const proof = buildPocProof(plotPath, plot.plot_id, challenge, this.cfg.plotSizeGb || plot.size_gb);
+      if (!proof) continue;
+      const leafHash = Buffer.from(proof.scoop_data, 'hex');
+      if (!plot.merkle_root || !verifyMerkleProofBuf(leafHash, proof.scoop_index, proof.total_scoops, proof.merkle_proof, plot.merkle_root)) {
+        log('warn', `Miner: skipping plot ${plot.plot_id} — merkle proof fails verification (incompatible plot format?)`);
+        continue;
+      }
       this.totalScans++;
-      if (proof && proof.deadline < bestDeadline) { bestDeadline = proof.deadline; bestProof = proof; bestPlot = plot; }
+      if (proof.deadline < bestDeadline) { bestDeadline = proof.deadline; bestProof = proof; bestPlot = plot; }
     }
     if (bestDeadline < Infinity) {
       this.bestDeadline = bestDeadline;
@@ -114,7 +120,6 @@ class Miner {
     const targets = [normalizeUrl(`http://127.0.0.1:${this.cfg.port}`)];
     const plot = this.db.prepare('SELECT size_gb FROM plot_commitments WHERE plot_id = ? AND miner = ?').get(plotId, this.address);
 
-    // Sign the proof submission so the network can verify the miner owns this address
     let proofSignature = '';
     if (this.cfg.minerPrivateKey) {
       try {
