@@ -265,8 +265,6 @@ function hashTransaction(tx) {
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
 }
 
-// Canonical message for proof-of-capacity submission signing.
-// The miner signs this to prove they control the claimed address and submitted this proof.
 function proofMessage(challengeId, miner, deadline, plotId) {
   return JSON.stringify({
     type: 'poc_proof',
@@ -280,8 +278,6 @@ function proofMessage(challengeId, miner, deadline, plotId) {
 function hashBlock(bloco) {
   let rewardsStr = '';
   if (Array.isArray(bloco.rewards)) {
-    // Normalize key order per reward entry so equivalent reward sets always hash the same,
-    // regardless of the property insertion order used by the caller.
     const normalized = bloco.rewards.map(r => {
       const n = {};
       for (const k of Object.keys(r).sort()) n[k] = r[k];
@@ -330,8 +326,6 @@ function computeContractStateLeaves(db) {
   return leaves;
 }
 
-// Raiz apenas do estado de contratos (storage + balances + code). Determinística entre
-// nós com a mesma sequência de blocos — alvo de validação no broadcast.
 function computeContractStateRoot(db) {
   return merkleRoot(computeContractStateLeaves(db));
 }
@@ -375,11 +369,6 @@ function calculateMiningReward(height, cfg) {
 }
 
 function isBetterChainCandidate(candidate, incumbent) {
-  // Chain selection must be driven by cumulative proof-of-work/capacity (chain_work).
-  // `nonce` is a per-block counter/PoW value, not a comparable "deadline" across blocks —
-  // using it here as a tiebreaker let a block with a numerically smaller nonce field
-  // win a tie it shouldn't, independent of actual chain work. Ties on chain_work now
-  // fall back to height, then lexicographically smallest hash for determinism.
   const cw = (b) => safeBigInt((b || {}).chain_work, 0n);
   const h = (b) => safeInt((b || {}).height, 0);
   if (cw(candidate) !== cw(incumbent)) return cw(candidate) > cw(incumbent);
@@ -387,17 +376,14 @@ function isBetterChainCandidate(candidate, incumbent) {
   return String((candidate || {}).hash || '') < String((incumbent || {}).hash || '');
 }
 
-// ── PoC (Proof of Capacity) ──
 const SCOOP_SIZE = 32;
 const SCOOPS_PER_NONCE = 8192;
 const MINING_SCOOP_MODULUS = 4096;
-const PLOT_FORMAT_V1 = 1;       // sem merkle tree interna
-const PLOT_FORMAT_V2 = 2;       // com merkle tree interna (nós internos após scoop data)
-const PLOT_FORMAT_V3 = 3;       // V2 + SHA-256 scoops + account_id
+const PLOT_FORMAT_V1 = 1;    
+const PLOT_FORMAT_V2 = 2;    
+const PLOT_FORMAT_V3 = 3;
 
 function merkleTreeInternalNodeCount(N) {
-  // Correct count: sum_{k=1}^{∞} ceil(N / 2^k)
-  // This is NOT N-1 when N is not a power of 2
   let total = 0;
   while (N > 1) {
     N = Math.ceil(N / 2);
