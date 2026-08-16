@@ -1,7 +1,7 @@
 const path = require('path');
 const { safeInt, safeBigInt, signMessage, proofMessage, verifyMerkleProofBuf } = require('./crypto');
 const { buildPocProof } = require('./plot');
-const { fetchJSON } = require('./sync');
+const { fetchJSON } = require('./P2P/sync');
 const { log } = require('./config');
 
 function normalizeUrl(url) {

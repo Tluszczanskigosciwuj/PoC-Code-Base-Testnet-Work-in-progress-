@@ -5,9 +5,41 @@ const { safeInt, safeBigInt, sha256hex, hashTransaction, pubkeyToAddress, pubKey
 const { log, getLogBuffer } = require('./config');
 const { createPlotFile } = require('./plot');
 
+const rateLimitStore = new Map();
+function rateLimit(options = {}) {
+  const { windowMs = 60000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
+  return (req, res, next) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${ip}`;
+    const now = Date.now();
+    const record = rateLimitStore.get(key) || { count: 0, resetTime: now + windowMs };
+    if (now > record.resetTime) {
+      record.count = 0;
+      record.resetTime = now + windowMs;
+    }
+    record.count++;
+    rateLimitStore.set(key, record);
+    res.setHeader('X-RateLimit-Limit', max);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, max - record.count));
+    res.setHeader('X-RateLimit-Reset', Math.ceil(record.resetTime / 1000));
+    if (record.count > max) {
+      return res.status(429).json({ error: message, retryAfter: Math.ceil((record.resetTime - now) / 1000) });
+    }
+    next();
+  };
+}
+
+function cleanupRateLimit() {
+  const now = Date.now();
+  for (const [key, record] of rateLimitStore.entries()) {
+    if (now > record.resetTime) rateLimitStore.delete(key);
+  }
+}
+setInterval(cleanupRateLimit, 60000);
+
 
 class Server {
-  constructor(cfg, db, chain, peers, sync, miner, challengeMgr, registry, NODE_ID, smartContracts = null) {
+  constructor(cfg, db, chain, peers, sync, miner, challengeMgr, registry, NODE_ID, smartContracts = null, p2pWsServer = null) {
     this.cfg = cfg;
     this.db = db;
     this.chain = chain;
@@ -18,6 +50,7 @@ class Server {
     this.registry = registry;
     this.NODE_ID = NODE_ID;
     this.smartContracts = smartContracts;
+    this.p2pWsServer = p2pWsServer;
     this.app = null;
     this.server = null;
     this.discoveryServer = null;
@@ -36,7 +69,7 @@ class Server {
           clearTimeout(timer);
           if (!res.ok) return null;
           const d = await res.json();
-          return { url: p.url, node_id: p.node_id, plots_count: d.plots_count || 0, capacidade_gb: Number(d.capacidade_gb) || 0, height: d.altura || 0 };
+          return { url: p.url, node_id: p.node_id, plots_count: d.plots_count || 0, capacity_gb: Number(d.capacidade_gb) || 0, height: d.height || 0 };
         } catch { return null; }
       });
       const settled = await Promise.allSettled(fetches);
@@ -64,26 +97,43 @@ class Server {
     app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
     app.use(express.json({ limit: '10mb' }));
 
-    app.use((req, res, next) => { res.header('Access-Control-Allow-Origin', '*'); res.header('Access-Control-Allow-Headers', '*'); res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE'); if (req.method === 'OPTIONS') return res.sendStatus(200); next(); });
+    const allowedOrigins = this.cfg.corsOrigins || (this.cfg.nodeUrl ? [this.cfg.nodeUrl] : []);
+    app.use((req, res, next) => {
+      const origin = req.headers.origin;
+      if (origin && allowedOrigins.includes(origin)) {
+        res.header('Access-Control-Allow-Origin', origin);
+      }
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
+      res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      if (req.method === 'OPTIONS') return res.sendStatus(200);
+      next();
+    });
 
     app.use(express.static(PUBLIC_DIR, { maxAge: 0 }));
+
+    const apiLimiter = rateLimit({ windowMs: 60000, max: 120, keyPrefix: 'api', message: 'Too many API requests' });
+    const mutationLimiter = rateLimit({ windowMs: 60000, max: 30, keyPrefix: 'mut', message: 'Too many mutation requests' });
+    const walletLimiter = rateLimit({ windowMs: 60000, max: 10, keyPrefix: 'wlt', message: 'Too many wallet requests' });
+    const p2pLimiter = rateLimit({ windowMs: 60000, max: 60, keyPrefix: 'p2p', message: 'Too many P2P requests' });
+
+    app.use(apiLimiter);
 
     const serveDashboard = (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
     app.get('/dashboard', serveDashboard);
     app.get('/', (req, res) => {
       if (req.accepts('html')) return serveDashboard(req, res);
-      res.json({ ok: true, node: 'choco', height: this.chain.altura });
+      res.json({ ok: true, node: 'choco', height: this.chain.height });
     });
 
     app.get('/api/stats', (req, res) => {
       const stats = this.chain.getStats();
-      const tip = this.chain.getBlock(this.chain.altura);
+      const tip = this.chain.getBlock(this.chain.height);
       const ns = this.registry.getStats();
       res.json({
         ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
-        symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.altura + 1, this.cfg).toString(),
-        current_reward_cc: Number(calculateMiningReward(this.chain.altura + 1, this.cfg)) / 1e18,
-        blocks_to_halving: this.cfg.halvingInterval - (this.chain.altura % this.cfg.halvingInterval),
+        symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
+        current_reward_cc: Number(calculateMiningReward(this.chain.height + 1, this.cfg)) / 1e18,
+        blocks_to_halving: this.cfg.halvingInterval - (this.chain.height % this.cfg.halvingInterval),
         halving_interval: this.cfg.halvingInterval, max_supply: this.cfg.maxSupply,
         seed_version: this.cfg.version, node_url: this.cfg.nodeUrl,
         node_id: this.NODE_ID, peers: { total: this.peers.count(), active: this.peers.active().length, banned: this.peers.banned().length, avg_health: 0 },
@@ -105,7 +155,7 @@ class Server {
           if (b) blocks.push(b); else break;
         }
       }
-      res.json({ blocks, total: this.chain.altura + 1 });
+      res.json({ blocks, total: this.chain.height + 1 });
     });
 
     app.get('/api/block/:heightOrHash', (req, res) => {
@@ -138,7 +188,7 @@ class Server {
         base_target: ch.base_target,
         plots: plotsCount,
         capacity_gb: Number(capacityGb.toFixed(2)),
-        difficulty: this.chain.altura > 0 ? '~' + this.chain.altura + ' blocks' : 'genesis',
+        difficulty: this.chain.height > 0 ? '~' + this.chain.height + ' blocks' : 'genesis',
       });
     });
 
@@ -147,10 +197,10 @@ class Server {
       res.json({ transactions: txs, count: txs.length });
     });
 
-    app.post('/api/mempool', (req, res) => {
+    app.post('/api/mempool', mutationLimiter, async (req, res) => {
       const tx = req.body;
       if (!tx || !tx.from_addr || (!tx.to_addr && !tx.data)) return res.status(400).json({ error: 'invalid transaction' });
-      const validation = this.chain.validateTxForMempool(tx);
+      const validation = await this.chain.validateTxForMempool(tx);
       if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
       if (!tx.hash) tx.hash = hashTransaction(tx);
       const result = this.chain.addMempoolTx(tx);
@@ -158,41 +208,57 @@ class Server {
       res.json(result);
     });
 
-    app.post('/api/wallet/sign-and-send', (req, res) => {
+    app.post('/api/wallet/prepare-tx', walletLimiter, async (req, res) => {
       try {
-        const { private_key, to_addr, amount, data } = req.body;
-        if (!private_key || (!to_addr && !data)) return res.status(400).json({ error: 'private_key and to_addr (or data for contract creation) required' });
+        const { from_addr, to_addr, amount, data, gas_limit, gas_price, chain_id, priority_fee } = req.body;
+        if (!from_addr || (!to_addr && !data)) return res.status(400).json({ error: 'from_addr and to_addr (or data for contract creation) required' });
+        
+        const normalizedFrom = from_addr.toLowerCase();
+        const user = this.db.prepare('SELECT balance, nonce, public_key_ed25519 FROM users WHERE lower(address) = lower(?)').get(normalizedFrom);
+        if (!user || !user.public_key_ed25519) return res.status(400).json({ error: 'address not registered (no public key)' });
+        
         const hasData = !!(data && /^0x[0-9a-fA-F]*$/.test(String(data)));
         const amountNum = amount === undefined || amount === null ? 0 : Number(amount);
         if (isNaN(amountNum) || amountNum < 0) return res.status(400).json({ error: 'invalid amount' });
         const valueWei = String(Math.round(amountNum * 1e18));
-        const key = Buffer.from(private_key, 'hex');
-        const prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
-        const pkcs8 = Buffer.concat([prefix, key]);
-        const privKeyObj = crypto2.createPrivateKey({ key: pkcs8, format: 'der', type: 'pkcs8' });
-        const pubKeyObj = crypto2.createPublicKey(privKeyObj);
-        const pubB64 = pubKeyObj.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64');
-        const from_addr = pubkeyToAddress(pubB64);
-        const now = Math.floor(Date.now() / 1000);
-        this.db.prepare('UPDATE users SET public_key_ed25519 = ?, updated_at = ? WHERE public_key_ed25519 = ? AND lower(address) != lower(?)').run(pubB64, now, pubB64, from_addr);
-        this.db.prepare('DELETE FROM users WHERE public_key_ed25519 = ? AND lower(address) != lower(?)').run(pubB64, from_addr);
-        this.db.prepare('INSERT INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_ed25519 = excluded.public_key_ed25519, updated_at = excluded.updated_at').run(from_addr, pubB64, now, now);
-        const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(from_addr);
-        const nonce = user ? (user.nonce || 0) : 0;
-        const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.altura + 1);
+        
+        const nonce = user.nonce || 0;
+        const gasPrice = gas_price || this.chain._baseFeeForHeight(this.chain.height + 1);
         const defaultGas = hasData ? 3000000 : 21000;
-        const gasLimit = req.body.gas_limit || defaultGas;
-        const fee = req.body.fee || (gasLimit === 21000 ? '21000' : String(gasLimit));
-        const tx = { from_addr, to_addr: to_addr || '', value: valueWei, nonce, fee, gas_limit: gasLimit, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0' };
+        const gasLimit = gas_limit || defaultGas;
+        const fee = (gasLimit === 21000) ? '21000' : String(gasLimit);
+        
+        const tx = {
+          from_addr: normalizedFrom,
+          to_addr: to_addr || '',
+          value: valueWei,
+          nonce,
+          fee,
+          gas_limit: gasLimit,
+          gas_price: String(gasPrice),
+          chain_id: chain_id || this.cfg.chainId || '0',
+          priority_fee: priority_fee || '0'
+        };
         if (hasData) tx.data = String(data);
+        
         const msg = canonicalTxMessage(tx);
-        tx.signature = signMessage(msg, private_key);
-        tx.hash = hashTransaction(tx);
-        const validation = this.chain.validateTxForMempool(tx);
-        if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
-        const result = this.chain.addMempoolTx(tx);
-        if (result.ok) setImmediate(() => this.sync.broadcastTx(tx));
-        res.json({ ok: true, hash: tx.hash, from: from_addr });
+        const txHash = hashTransaction(tx);
+        
+        const estimatedGas = require('./crypto').estimateIntrinsicGas ? require('./crypto').estimateIntrinsicGas(tx) : gasLimit;
+        const currentBaseFee = BigInt(this.chain._baseFeeForHeight(this.chain.height + 1));
+        const estimatedFee = (BigInt(gasLimit) * currentBaseFee).toString();
+        
+        res.json({
+          ok: true,
+          transaction: tx,
+          sign_message: msg,
+          tx_hash: txHash,
+          estimated_gas: estimatedGas,
+          estimated_fee: estimatedFee,
+          gas_price: String(currentBaseFee),
+          balance: user.balance,
+          nonce
+        });
       } catch (e) { res.status(400).json({ error: e.message }); }
     });
 
@@ -208,7 +274,7 @@ class Server {
       res.json(u);
     });
     app.get('/api/gas/price', (req, res) => {
-      const dynamicPrice = this.chain._baseFeeForHeight(this.chain.altura + 1);
+      const dynamicPrice = this.chain._baseFeeForHeight(this.chain.height + 1);
       res.json({ gas_price: String(dynamicPrice), unit: 'wei' });
     });
     app.get('/api/users/:address', (req, res) => {
@@ -217,36 +283,9 @@ class Server {
       res.json(u);
     });
 
-    app.post('/api/wallet/create', (req, res) => {
-      const { publicKey, privateKey } = crypto2.generateKeyPairSync('ed25519');
-      const pubB64 = publicKey.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64');
-      const addr = pubkeyToAddress(pubB64);
-      const privRaw = privateKey.export({ type: 'pkcs8', format: 'der' });
-      const privHex = privRaw.subarray(privRaw.length - 32).toString('hex');
-      const now = Math.floor(Date.now() / 1000);
-      this.db.prepare('INSERT OR IGNORE INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?,?)').run(addr, pubB64, '0', 0, now, now);
-      log('info', `Created wallet: address=${addr}, public_key=${pubB64}`);
-      res.json({ ok: true, address: addr, public_key: pubB64, private_key: privHex });
-    });
-
-    app.post('/api/wallet/import', (req, res) => {
-      const { address, public_key, private_key } = req.body;
-      if (private_key) {
-        try {
-          const key = Buffer.from(private_key, 'hex');
-          const prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
-          const pkcs8 = Buffer.concat([prefix, key]);
-          const privKeyObj = crypto2.createPrivateKey({ key: pkcs8, format: 'der', type: 'pkcs8' });
-          const pubKeyObj = crypto2.createPublicKey(privKeyObj);
-          const pubB64 = pubKeyObj.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64');
-          const addr = pubkeyToAddress(pubB64);
-          const now = Math.floor(Date.now() / 1000);
-          this.db.prepare('INSERT INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_ed25519 = excluded.public_key_ed25519, updated_at = excluded.updated_at').run(addr, pubB64, now, now);
-          log('info', `Imported wallet: address=${addr}, public_key=${pubB64}`);
-          return res.json({ ok: true, address: addr, public_key: pubB64 });
-        } catch (e) { return res.status(400).json({ error: 'Invalid private key: ' + e.message }); }
-      }
-      if (!address || !public_key) return res.status(400).json({ error: 'address and public_key (or private_key) required' });
+    app.post('/api/wallet/import', walletLimiter, (req, res) => {
+      const { address, public_key } = req.body;
+      if (!address || !public_key) return res.status(400).json({ error: 'address and public_key required (private keys never sent to node)' });
       const normalizedAddress = address.toLowerCase();
       try { if (pubkeyToAddress(public_key).toLowerCase() !== normalizedAddress) return res.status(400).json({ error: 'address does not match public key' }); } catch { return res.status(400).json({ error: 'Invalid public key' }); }
       const now = Math.floor(Date.now() / 1000);
@@ -255,7 +294,7 @@ class Server {
       res.json({ ok: true, address: normalizedAddress });
     });
 
-    app.post('/api/wallet/register', (req, res) => {
+    app.post('/api/wallet/register', walletLimiter, (req, res) => {
       const { address, public_key } = req.body;
       if (!address || !public_key) return res.status(400).json({ error: 'address and public_key required' });
       const normalizedAddress = address.toLowerCase();
@@ -279,8 +318,8 @@ class Server {
       res.json({ ...this.chain.getStats(), chain_id: this.cfg.chainId, chain_name: this.cfg.chainName, symbol: this.cfg.symbol, node_url: this.cfg.nodeUrl, node_id: this.NODE_ID, version: this.cfg.version, peers: this.peers.gossipPeers(20) });
     });
     app.get('/api/node/status', (req, res) => res.json({
-      height: this.chain.altura, hash: this.chain.melhorHash,
-      chain_work: (this.chain.getBlock(this.chain.altura) || {}).chain_work || '0',
+      height: this.chain.height, hash: this.chain.bestHash,
+      chain_work: (this.chain.getBlock(this.chain.height) || {}).chain_work || '0',
       peer_count: this.peers.count(), mining_active: this.miner.active,
       miner_address: this.miner.address, node_url: this.cfg.nodeUrl,
     }));
@@ -288,7 +327,7 @@ class Server {
     app.get('/api/node/peers/gossip', (req, res) => res.json({ peers: this.peers.gossipPeers(50) }));
 
     app.get('/api/peers', (req, res) => res.json({ peers: this.peers.all(100) }));
-    app.post('/api/peers/add', (req, res) => {
+    app.post('/api/peers/add', p2pLimiter, (req, res) => {
       const url = require('./config').normalizeUrl(req.body.url);
       if (!url) return res.status(400).json({ error: 'invalid url' });
       this.peers.add(url);
@@ -312,6 +351,7 @@ class Server {
       if (result.bloco && this.sync) {
         const block = result.bloco;
         setImmediate(() => { this.sync.broadcastBlock(block); });
+        if (this.p2pWsServer) this.p2pWsServer.broadcastBlock(block);
       }
       res.json(result);
     });
@@ -426,20 +466,112 @@ class Server {
         this.db.prepare('INSERT INTO users (address, public_key_ed25519, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_ed25519 = excluded.public_key_ed25519, updated_at = excluded.updated_at').run(from_addr, pubB64, now, now);
         const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(from_addr);
         const nonce = user ? (user.nonce || 0) : 0;
-        const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.altura + 1);
+        const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.height + 1);
         const gasLimit = req.body.gas_limit || 3000000;
         const tx = { from_addr, to_addr: address, value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce, fee: req.body.fee || String(gasLimit), gas_limit: gasLimit, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0', data: calldata };
         const msg = canonicalTxMessage(tx);
         tx.signature = signMessage(msg, pkHex);
         tx.hash = hashTransaction(tx);
-        const validation = this.chain.validateTxForMempool(tx);
+const validation = await this.chain.validateTxForMempool(tx);
         if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
         const result = this.chain.addMempoolTx(tx);
-        if (result.ok) setImmediate(() => this.sync.broadcastTx(tx));
+if (result.ok) {
+        setImmediate(() => this.sync.broadcastTx(tx));
+        if (this.p2pWsServer) this.p2pWsServer.broadcastTx(tx);
+      }
         res.json({ ok: true, mode: 'tx', hash: tx.hash, from: from_addr });
         log('info', `[SMART CONTRACTS] Executed contract tx: address=${address}, sender=${from_addr}, tx=${tx.hash}`);
       } catch (e) {
         res.status(400).json({ error: e.code || 'EXECUTE_FAILED', message: e.message });
+      }
+    });
+
+    const p2pExchangeEnabled = () => !!this.cfg.p2pExchangeEnabled;
+    const p2pExchangeDisabled = (res) => res.status(503).json({ error: 'P2P exchange disabled on this node', enabled: false });
+
+    let p2pExchange = null;
+    if (p2pExchangeEnabled()) {
+      try {
+        const { P2PExchange } = require('./vm/p2p-exchange');
+        p2pExchange = new P2PExchange(this.chain, this.cfg);
+        p2pExchange.initSchema();
+        log('info', `[P2P-EXCHANGE] P2P exchange enabled`);
+      } catch (e) {
+        log('warn', `[P2P-EXCHANGE] Failed to initialize: ${e.message}`);
+      }
+    }
+
+    app.get('/api/p2p/assets', (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      res.json({ assets: p2pExchange.listAssets() });
+    });
+
+    app.post('/api/p2p/offers', mutationLimiter, async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      try {
+        const result = await p2pExchange.createOffer(req.body);
+        res.json(result);
+      } catch (e) {
+        res.status(400).json({ error: e.message });
+      }
+    });
+
+    app.get('/api/p2p/offers', async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      const { pluginId, asset, status, limit, offset } = req.query;
+      const result = await p2pExchange.listOffers({
+        pluginId, asset, status, limit: parseInt(limit) || 50, offset: parseInt(offset) || 0
+      });
+      res.json(result);
+    });
+
+    app.get('/api/p2p/offers/:id', async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      const result = await p2pExchange.getOffer(req.params.id);
+      res.json(result);
+    });
+
+    app.get('/api/p2p/offers/:id/status', async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      const result = await p2pExchange.getOfferStatus(req.params.id);
+      res.json(result);
+    });
+
+    app.post('/api/p2p/offers/:id/take', mutationLimiter, async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      try {
+        const result = await p2pExchange.takeOffer({ offerId: req.params.id, ...req.body });
+        res.json(result);
+      } catch (e) {
+        res.status(400).json({ error: e.message });
+      }
+    });
+
+    app.post('/api/p2p/offers/:id/claim', mutationLimiter, async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      try {
+        const result = await p2pExchange.claimOffer({ offerId: req.params.id, ...req.body });
+        res.json(result);
+      } catch (e) {
+        res.status(400).json({ error: e.message });
+      }
+    });
+
+    app.post('/api/p2p/offers/:id/refund', mutationLimiter, async (req, res) => {
+      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
+      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
+      try {
+        const result = await p2pExchange.refundOffer({ offerId: req.params.id, ...req.body });
+        res.json(result);
+      } catch (e) {
+        res.status(400).json({ error: e.message });
       }
     });
 
@@ -464,37 +596,47 @@ class Server {
     };
     app.get('/api/logs', requireAdmin, (req, res) => res.json({ logs: getLogBuffer() }));
 
-    app.post('/api/node/broadcast/block', async (req, res) => {
+    app.post('/api/node/broadcast/block', p2pLimiter, async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
-      const extendTip = safeInt(block.height, 0) > this.chain.altura;
-      const minerPk = extendTip && block.miner ? this.chain.db.prepare('SELECT 1 FROM users WHERE lower(address) = lower(?) AND public_key_ed25519 IS NOT NULL AND public_key_ed25519 != ""').get(block.miner) : null;
-      const result = await this.chain.addBlock(block, { skipPocValidation: true, skipSignature: !minerPk, skipTargetValidation: true, skipStateValidation: true, skipHashValidation: true, forceSync: true });
-      log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} altura=${this.chain.altura}`);
+      const extendTip = safeInt(block.height, 0) > this.chain.height;
+      const minerPk = block.miner ? this.chain.db.prepare('SELECT 1 FROM users WHERE lower(address) = lower(?) AND public_key_ed25519 IS NOT NULL AND public_key_ed25519 != ""').get(block.miner) : null;
+      const result = await this.chain.addBlock(block, {
+        skipPocValidation: false,
+        skipSignature: false,
+        skipTargetValidation: false,
+        skipStateValidation: false,
+        skipHashValidation: false,
+        forceSync: extendTip,
+      });
+      log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} height=${this.chain.height}`);
       res.json(result);
     });
 
-    app.post('/api/node/broadcast/tx', (req, res) => {
+    app.post('/api/node/broadcast/tx', p2pLimiter, (req, res) => {
       const tx = req.body.tx;
       if (!tx) return res.status(400).json({ error: 'tx required' });
       const validation = this.chain.validateTxForMempool(tx);
       if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
       const result = this.chain.addMempoolTx(tx);
       log('info', `[TX] Mempool tx: miner=${tx.miner}, plot_id=${tx.plot_id}, deadline=${tx.deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
-      if (result.ok && result.motivo !== 'Tx already in mempool') {
+if (result.ok && result.motivo !== 'Tx already in mempool') {
         const relayHops = safeInt(tx.relay_hops, 0);
-        if (relayHops < 2) setImmediate(() => this.sync.broadcastTx({ ...tx, relay_hops: relayHops + 1 }));
+        if (relayHops < 2) {
+          setImmediate(() => this.sync.broadcastTx({ ...tx, relay_hops: relayHops + 1 }));
+          if (this.p2pWsServer) this.p2pWsServer.broadcastTx({ ...tx, relay_hops: relayHops + 1 });
+        }
       }
       res.json(result);
     });
 
-    app.post('/api/node/announce', (req, res) => {
+    app.post('/api/node/announce', p2pLimiter, (req, res) => {
       const url = require('./config').normalizeUrl(req.body.url);
       if (!url) return res.status(400).json({ error: 'url required' });
       this.peers.add(url);
       this.peers.seen(url, safeInt(req.body.height, 0), req.body.node_id);
       log('info', `[P2P] Node announce: url=${url}, height=${req.body.height}, node_id=${req.body.node_id}`);
-      res.json({ ok: true, our_height: this.chain.altura, node_id: this.NODE_ID, peers: this.peers.gossipPeers(10) });
+      res.json({ ok: true, our_height: this.chain.height, node_id: this.NODE_ID, peers: this.peers.gossipPeers(10) });
     });
 
     app.get('/peers', (req, res) => res.json({ peers: this.peers.gossipPeers(50), count: this.peers.count() }));
@@ -503,7 +645,7 @@ class Server {
       res.json({ ...ns, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName, symbol: this.cfg.symbol, seed_version: this.cfg.version, node_url: this.cfg.nodeUrl, node_id: this.NODE_ID });
     });
 
-    app.post('/register', (req, res) => {
+    app.post('/register', p2pLimiter, (req, res) => {
       const url = require('./config').normalizeUrl(req.body.url);
       if (!url || !req.body.node_id) return res.status(400).json({ error: 'url and node_id required' });
       this.peers.add(url);
@@ -543,7 +685,7 @@ class Server {
       const challenge = this.challengeMgr.getOrCreate();
       if (!challenge) return res.status(400).json({ error: 'no challenge' });
       await this.challengeMgr._forgeBlockForChallenge(this.chain, this.sync, challenge);
-      log('info', `[P2P] Forge block request: challenge_id=${challenge.challenge_id}, height=${this.chain.altura}`);
+      log('info', `[P2P] Forge block request: challenge_id=${challenge.challenge_id}, height=${this.chain.height}`);
       res.json({ ok: true });
     });
 
@@ -574,13 +716,13 @@ class Server {
     app.get('/api/nodes', (req, res) => res.json({ nodes: this.registry.all() }));
 
     app.get('/api/health', (req, res) => res.json({
-      ok: true, status: 'ok', height: this.chain.altura, hash: this.chain.melhorHash,
+      ok: true, status: 'ok', height: this.chain.height, hash: this.chain.bestHash,
       peers: this.peers.count(), mempool: this.db.prepare('SELECT COUNT(*) as c FROM mempool').get().c,
       mining: this.miner.active, uptime: Math.floor((Date.now() - this._startTime) / 1000),
     }));
 
     app.get('/api/state', (req, res) => {
-      const h = { height: this.chain.altura, hash: this.chain.melhorHash, chain_work: (this.chain.getBlock(this.chain.altura) || {}).chain_work || '0', peers: this.peers.count(), uptime: Math.floor((Date.now() - this._startTime) / 1000) };
+      const h = { height: this.chain.height, hash: this.chain.bestHash, chain_work: (this.chain.getBlock(this.chain.height) || {}).chain_work || '0', peers: this.peers.count(), uptime: Math.floor((Date.now() - this._startTime) / 1000) };
       const st = this.chain.getStats();
       const mining = { active: this.miner.active, address: this.miner.address, ...this.miner.getMetrics() };
       const mempoolTxs = this.chain.getMempoolForBlock(50);

@@ -1,16 +1,12 @@
 const fs = require('fs');
 const crypto = require('crypto');
-const { sha256hex, sha256buf, merkleRootBuf2, computeMerkleProofBuf2, computeMerkleTreeNodes, merkleTreeInternalNodeCount, computeDeadline, plotScoopCount, SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, ZERO_HASH, PLOT_FORMAT_V1, PLOT_FORMAT_V2, PLOT_FORMAT_V3 } = require('./crypto');
+const { sha256hex, sha256buf, merkleRootBuf2, computeMerkleProofBuf2, computeMerkleTreeNodes, merkleTreeInternalNodeCount, computeDeadline, plotScoopCount, SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, ZERO_HASH, PLOT_FORMAT_V3 } = require('./crypto');
 const { log } = require('./config');
 
 const HEADER_SIZE = 256;
 
-function plotTotalSize(totalScoops, formatVersion) {
-  const scoopDataSize = totalScoops * SCOOP_SIZE;
-  if (formatVersion === PLOT_FORMAT_V2 || formatVersion === PLOT_FORMAT_V3) {
-    return HEADER_SIZE + scoopDataSize + merkleTreeInternalNodeCount(totalScoops) * 32;
-  }
-  return HEADER_SIZE + scoopDataSize;
+function plotTotalSize(totalScoops) {
+  return HEADER_SIZE + totalScoops * SCOOP_SIZE + merkleTreeInternalNodeCount(totalScoops) * 32;
 }
 
 function detectPlotFormat(plotPath) {
@@ -26,27 +22,16 @@ function detectPlotFormat(plotPath) {
       const totalScoops = header.readUInt32LE(64);
       const scoopSize = header.readUInt32LE(68);
       if (totalScoops < 1) return null;
-      if (version === PLOT_FORMAT_V3 && scoopSize === 32) {
-        const expected = plotTotalSize(totalScoops, PLOT_FORMAT_V3);
-        if (stat.size === expected) return { version: PLOT_FORMAT_V3, totalScoops, accountId: header.slice(104, 136).toString('hex') };
-      }
-      if (version === PLOT_FORMAT_V2 && scoopSize === 64) {
-        const expected = plotTotalSize(totalScoops, PLOT_FORMAT_V2);
-        if (stat.size === expected) return { version: PLOT_FORMAT_V2, totalScoops };
-      }
-      if (version === PLOT_FORMAT_V1) {
-        return { version: PLOT_FORMAT_V1, totalScoops };
-      }
-      const expectedV2 = plotTotalSize(totalScoops, PLOT_FORMAT_V2);
-      if (stat.size === expectedV2) return { version: PLOT_FORMAT_V2, totalScoops };
-      return { version: PLOT_FORMAT_V1, totalScoops };
+      if (version !== PLOT_FORMAT_V3 || scoopSize !== 32) return null;
+      const expected = plotTotalSize(totalScoops);
+      if (stat.size !== expected) return null;
+      return { version: PLOT_FORMAT_V3, totalScoops, accountId: header.slice(104, 136).toString('hex') };
     } finally { fs.closeSync(fd); }
   } catch { return null; }
 }
 
-function readMerkleProofFromFile(plotPath, totalScoops, scoopIndex, scoopSize) {
-  scoopSize = scoopSize || SCOOP_SIZE;
-  const treeStart = HEADER_SIZE + totalScoops * scoopSize;
+function readMerkleProofFromFile(plotPath, totalScoops, scoopIndex) {
+  const treeStart = HEADER_SIZE + totalScoops * SCOOP_SIZE;
   const fd = fs.openSync(plotPath, 'r');
   try {
     const proof = [];
@@ -58,9 +43,9 @@ function readMerkleProofFromFile(plotPath, totalScoops, scoopIndex, scoopSize) {
       const siblingIdx = idx ^ 1;
       if (siblingIdx < count) {
         if (count === totalScoops) {
-          const pos = HEADER_SIZE + siblingIdx * scoopSize;
-          const buf = Buffer.alloc(scoopSize);
-          fs.readSync(fd, buf, 0, scoopSize, pos);
+          const pos = HEADER_SIZE + siblingIdx * SCOOP_SIZE;
+          const buf = Buffer.alloc(SCOOP_SIZE);
+          fs.readSync(fd, buf, 0, SCOOP_SIZE, pos);
           proof.push(buf);
         } else {
           const pos = treeStart + (treeOffset + siblingIdx) * 32;
@@ -78,16 +63,15 @@ function readMerkleProofFromFile(plotPath, totalScoops, scoopIndex, scoopSize) {
   } finally { fs.closeSync(fd); }
 }
 
-function readPlotScoops(plotPath, totalScoops, scoopSize) {
-  scoopSize = scoopSize || SCOOP_SIZE;
+function readPlotScoops(plotPath, totalScoops) {
   const fd = fs.openSync(plotPath, 'r');
   try {
     const buf = Buffer.alloc(totalScoops * 32);
-    const scoop = Buffer.alloc(scoopSize);
+    const scoop = Buffer.alloc(SCOOP_SIZE);
     for (let i = 0; i < totalScoops; i++) {
-      const pos = HEADER_SIZE + i * scoopSize;
-      const bytes = fs.readSync(fd, scoop, 0, scoopSize, pos);
-      if (bytes < scoopSize) scoop.fill(0, bytes);
+      const pos = HEADER_SIZE + i * SCOOP_SIZE;
+      const bytes = fs.readSync(fd, scoop, 0, SCOOP_SIZE, pos);
+      if (bytes < SCOOP_SIZE) scoop.fill(0, bytes);
       sha256buf(scoop).copy(buf, i * 32);
     }
     return buf;
@@ -99,7 +83,6 @@ function buildPocProof(plotPath, plotId, challenge, plotSizeGb) {
   const fmt = detectPlotFormat(plotPath);
   if (!fmt) return null;
   const totalScoops = fmt.totalScoops;
-  const scoopSize = fmt.version === PLOT_FORMAT_V3 ? 32 : 64;
   const miningModulus = MINING_SCOOP_MODULUS;
   try {
     const fd = fs.openSync(plotPath, 'r');
@@ -110,22 +93,16 @@ function buildPocProof(plotPath, plotId, challenge, plotSizeGb) {
       let bestDeadline = Infinity, bestScoopData = null;
       let bestScoopIndex = 0;
       for (let i = scoopNum; i < totalScoops; i += miningModulus) {
-        const pos = HEADER_SIZE + i * scoopSize;
-        const buf = Buffer.alloc(scoopSize);
-        const bytes = fs.readSync(fd, buf, 0, scoopSize, pos);
-        if (bytes < scoopSize) buf.fill(0, bytes);
+        const pos = HEADER_SIZE + i * SCOOP_SIZE;
+        const buf = Buffer.alloc(SCOOP_SIZE);
+        const bytes = fs.readSync(fd, buf, 0, SCOOP_SIZE, pos);
+        if (bytes < SCOOP_SIZE) buf.fill(0, bytes);
         const dl = computeDeadline(buf, genSig, plotSizeGb, challenge.base_target || undefined);
         if (dl < bestDeadline) { bestDeadline = dl; bestScoopData = buf; bestScoopIndex = i; }
       }
       if (bestDeadline === Infinity || bestDeadline <= 0) return null;
 
-      let merkleProof;
-      if (fmt.version === PLOT_FORMAT_V2 || fmt.version === PLOT_FORMAT_V3) {
-        merkleProof = readMerkleProofFromFile(plotPath, totalScoops, bestScoopIndex, scoopSize);
-      } else {
-        const leafBuf = readPlotScoops(plotPath, totalScoops, scoopSize);
-        merkleProof = computeMerkleProofBuf2(leafBuf, totalScoops, bestScoopIndex);
-      }
+      const merkleProof = readMerkleProofFromFile(plotPath, totalScoops, bestScoopIndex);
 
       const proofDigest = sha256hex(Buffer.concat([bestScoopData, Buffer.from(String(bestDeadline))]));
       return { proof_version: 1, scoop_num: scoopNum, deadline: Math.floor(bestDeadline), proof_digest: proofDigest, read_count: Math.ceil(totalScoops / miningModulus), scoop_data: bestScoopData.toString('hex'), merkle_proof: merkleProof.map(b => b.toString('hex')), scoop_index: bestScoopIndex, total_scoops: totalScoops };
@@ -138,20 +115,15 @@ function computePlotMerkleRoot(plotPath, plotSizeGb) {
   const fmt = detectPlotFormat(plotPath);
   if (!fmt) return null;
   const totalScoops = fmt.totalScoops;
-  const scoopSize = fmt.version === PLOT_FORMAT_V3 ? 32 : 64;
-  if (fmt.version === PLOT_FORMAT_V2 || fmt.version === PLOT_FORMAT_V3) {
-    const treeCount = merkleTreeInternalNodeCount(totalScoops);
-    const treeStart = HEADER_SIZE + totalScoops * scoopSize;
-    const rootOffset = treeStart + (treeCount - 1) * 32;
-    const buf = Buffer.alloc(32);
-    const fd = fs.openSync(plotPath, 'r');
-    try {
-      fs.readSync(fd, buf, 0, 32, rootOffset);
-      return buf.toString('hex');
-    } finally { fs.closeSync(fd); }
-  }
-  const leafBuf = readPlotScoops(plotPath, totalScoops, scoopSize);
-  return merkleRootBuf2(leafBuf, totalScoops).toString('hex');
+  const treeCount = merkleTreeInternalNodeCount(totalScoops);
+  const treeStart = HEADER_SIZE + totalScoops * SCOOP_SIZE;
+  const rootOffset = treeStart + (treeCount - 1) * 32;
+  const buf = Buffer.alloc(32);
+  const fd = fs.openSync(plotPath, 'r');
+  try {
+    fs.readSync(fd, buf, 0, 32, rootOffset);
+    return buf.toString('hex');
+  } finally { fs.closeSync(fd); }
 }
 
 function computeAccountId(publicKey) {
@@ -192,7 +164,7 @@ function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
   const treeNodes = computeMerkleTreeNodes(leafBuf, totalScoops);
   const root = treeNodes.subarray(-32).toString('hex') || ZERO_HASH;
 
-  const plotSize = plotTotalSize(totalScoops, PLOT_FORMAT_V3);
+  const plotSize = plotTotalSize(totalScoops);
   const buf = Buffer.alloc(plotSize);
 
   buf.write('CHOCOHUB', 0, 'ascii');
@@ -203,7 +175,7 @@ function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
   buf.writeUInt32LE(idLow, 16);
   buf.write(minerAddress.padEnd(44, '\0'), 20, 44, 'ascii');
   buf.writeUInt32LE(totalScoops, 64);
-  buf.writeUInt32LE(32, 68);
+  buf.writeUInt32LE(SCOOP_SIZE, 68);
   buf.write(root, 72, 64, 'hex');
   accountId.copy(buf, 104);
 

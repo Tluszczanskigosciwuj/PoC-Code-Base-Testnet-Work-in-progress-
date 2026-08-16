@@ -79,8 +79,13 @@ function loadConfig() {
     upnpEnabled: true,
     discoveryUrl: '',
     discoveryPort: 7777,
-    smartContractsEnabled: false,
-    optionalModulesAsked: false,
+smartContractsEnabled: false,
+  optionalModulesAsked: false,
+  corsOrigins: [],
+  p2pExchangeEnabled: false,
+  maxP2POffersPerUser: 50,
+  p2pOfferTtlSec: 86400,
+  p2pWsPort: 0,
   };
 
   if (fs.existsSync(CONFIG_PATH)) {
@@ -121,6 +126,11 @@ function loadConfig() {
   defaults.targetGasPerBlock = envInt('TARGET_GAS_PER_BLOCK', defaults.targetGasPerBlock);
   defaults.maxGasPerBlock = envInt('MAX_GAS_PER_BLOCK', defaults.maxGasPerBlock);
   defaults.smartContractsEnabled = envBool('SMART_CONTRACTS_ENABLED', defaults.smartContractsEnabled);
+  defaults.corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  defaults.p2pExchangeEnabled = envBool('P2P_EXCHANGE_ENABLED', defaults.p2pExchangeEnabled);
+  defaults.maxP2POffersPerUser = envInt('MAX_P2P_OFFERS_PER_USER', defaults.maxP2POffersPerUser);
+  defaults.p2pOfferTtlSec = envInt('P2P_OFFER_TTL_SEC', defaults.p2pOfferTtlSec);
+  defaults.p2pWsPort = envInt('P2P_WS_PORT', defaults.p2pWsPort);
 
   return defaults;
 }

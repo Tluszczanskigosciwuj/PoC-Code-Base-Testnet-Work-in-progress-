@@ -5,14 +5,15 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { loadConfig, saveConfig, log, setLogLevel } = require('./config');
-const { initDB } = require('./db');
-const { Chain } = require('./chain');
-const { ChallengeManager, getTier } = require('./challenge');
-const { PeerManager } = require('./peers');
-const { SyncEngine } = require('./sync');
+const { initDB } = require('./Blockchain/db');
+const { Chain } = require('./Blockchain/chain');
+const { ChallengeManager, getTier } = require('./Blockchain/challenge');
+const { PeerManager } = require('./P2P/peers');
+const { SyncEngine } = require('./P2P/sync');
 const { Miner } = require('./miner');
 const { Server } = require('./server');
-const { DiscoveryServer, connectDiscoveryServer } = require('./discovery');
+const { P2PWebSocketServer } = require('./P2P/p2p-ws');
+// const { DiscoveryServer, connectDiscoveryServer } = require('./discovery'); // Removed: consolidated to HTTP-based discovery
 const { setupOptionalModules, loadOptionalModules } = require('./optional');
 
 class NodeRegistry {
@@ -41,7 +42,7 @@ class ChocoNode {
     this.sync = null;
     this.miner = null;
     this.server = null;
-    this.discoveryServer = null;
+    this.p2pWsServer = null;
     this._stopDiscovery = null;
   }
 
@@ -97,13 +98,14 @@ class ChocoNode {
     this.sync = new SyncEngine(this.db, cfg, this.chain, this.peers, this.challengeMgr, this.NODE_ID);
     this.miner = new Miner(this.db, cfg, this.chain, this.challengeMgr, this.sync, this.peers, this.NODE_ID);
 
-    if (cfg.discoveryPort > 0) {
-      this.discoveryServer = new DiscoveryServer(cfg.discoveryPort);
-      this.discoveryServer.start();
-    }
-
-    this.server = new Server(cfg, this.db, this.chain, this.peers, this.sync, this.miner, this.challengeMgr, this.registry, this.NODE_ID, this.smartContracts);
+    this.server = new Server(cfg, this.db, this.chain, this.peers, this.sync, this.miner, this.challengeMgr, this.registry, this.NODE_ID, this.smartContracts, this.p2pWsServer);
     this.server.start();
+
+    if (cfg.p2pWsPort && cfg.p2pWsPort > 0) {
+      this.p2pWsServer = new P2PWebSocketServer(cfg.p2pWsPort, this.chain, this.sync, this.peers);
+      await this.p2pWsServer.start();
+      log('info', `[P2P-WS] WebSocket P2P server started on port ${cfg.p2pWsPort}`);
+    }
 
     setInterval(() => { try { this.peers.decayHealth(); } catch {} }, 300000);
     setInterval(() => { try { this.chain.cleanMempool(); } catch {} }, 60000);
@@ -115,7 +117,7 @@ class ChocoNode {
 
     setTimeout(async () => {
       log('info', 'Initial sync...');
-      for (let i = 0; i < 3; i++) { try { await this.sync.loopSync(); } catch {} if (this.chain.altura > 0) break; }
+      for (let i = 0; i < 3; i++) { try { await this.sync.loopSync(); } catch {} if (this.chain.height > 0) break; }
       try { await this.sync.mempoolSync(); } catch {}
       if (cfg.nodeUrl) {
         await this.sync.announce();
@@ -124,9 +126,7 @@ class ChocoNode {
       if (cfg.miningEnabled && cfg.minerAddress) {
         setTimeout(() => this.miner.start(cfg.minerAddress), 3000);
       }
-      if (cfg.discoveryUrl) {
-        this._stopDiscovery = connectDiscoveryServer(cfg, this.peers, this.chain, this.sync);
-      }
+      // Removed WebSocket discovery client - using HTTP-based discovery in SyncEngine instead
     }, 2000);
 
     this._setupShutdown();
@@ -156,7 +156,6 @@ class ChocoNode {
   _setupShutdown() {
     const shutdown = () => {
       if (this._stopDiscovery) this._stopDiscovery();
-      if (this.discoveryServer) try { this.discoveryServer.stop(); } catch {}
       log('info', 'Shutting down...');
       this.miner.stop();
       try { this.db.close(); } catch {}

@@ -186,6 +186,12 @@ function merkleRoot(hashes) {
   return nodes[0];
 }
 
+function merkleRootBuffer(hashes) {
+  if (!hashes.length) return Buffer.alloc(32).toString('hex');
+  const bufHashes = hashes.map(h => Buffer.from(h, 'hex'));
+  return merkleRootBuf(bufHashes).toString('hex');
+}
+
 function computeMerkleProof(leaves, leafIndex) {
   let nodes = [...leaves];
   let idx = leafIndex;
@@ -379,8 +385,6 @@ function isBetterChainCandidate(candidate, incumbent) {
 const SCOOP_SIZE = 32;
 const SCOOPS_PER_NONCE = 8192;
 const MINING_SCOOP_MODULUS = 4096;
-const PLOT_FORMAT_V1 = 1;    
-const PLOT_FORMAT_V2 = 2;    
 const PLOT_FORMAT_V3 = 3;
 
 function merkleTreeInternalNodeCount(N) {
@@ -475,10 +479,10 @@ function getChainWorkForBlock(blk) {
 
 module.exports = {
   ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, pubkeyToAddress, pubKeyToAddress,
-  signMessage, verifySignature, merkleRoot, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf,
+  signMessage, verifySignature, merkleRoot, merkleRootBuffer, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf,
   canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage,
   computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, calculateMiningReward, isBetterChainCandidate,
-  SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V1, PLOT_FORMAT_V2, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
+  SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
   TIERS, EFFECTIVE_CAPACITY_CAP_GB, getTier, computeEffectiveCapacityGb, computeBaseTargetWithTier,
 };
