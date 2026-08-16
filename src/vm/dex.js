@@ -51,8 +51,8 @@ function blockAt(timestamp) {
 }
 
 function makeBlock(chain, blk, miner) {
-  const parent = chain.getBlock(chain.altura);
-  const height = chain.altura + 1;
+  const parent = chain.getBlock(chain.height);
+  const height = chain.height + 1;
   const now = blk.timestamp || Math.floor(Date.now() / 1000);
   return {
     height, parent_hash: parent ? parent.hash : ZERO_HASH,
@@ -377,7 +377,7 @@ function createDex(opts) {
     },
 
     async stateRoots() {
-      const tip = chain.getBlock(chain.altura);
+      const tip = chain.getBlock(chain.height);
       return {
         stateRoot: tip.state_root,
         stateRecompute: computeStateRoot(db),
