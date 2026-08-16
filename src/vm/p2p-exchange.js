@@ -1,6 +1,7 @@
-const crypto = require('crypto');
-const { load } = require('./modules');
-const pluginRegistry = require('./modules');
+import crypto from 'crypto';
+import { load } from './modules/index.js';
+
+const pluginRegistry = load();
 
 const SWAP_TIMEOUT = 24 * 60 * 60;
 
@@ -8,7 +9,7 @@ class P2PExchange {
   constructor(dex, cfg = {}) {
     this.dex = dex;
     this.cfg = cfg;
-    this.plugins = pluginRegistry.load();
+    this.plugins = pluginRegistry;
     this.enabled = cfg.p2pExchangeEnabled !== false;
     this.maxOffersPerUser = cfg.maxP2POffersPerUser || 50;
     this.offerTtlSec = cfg.p2pOfferTtlSec || SWAP_TIMEOUT;
@@ -29,7 +30,7 @@ class P2PExchange {
   _validatePlugin(pluginId) {
     const plugin = this.plugins[pluginId];
     if (!plugin) throw new Error(`Plugin ${pluginId} not loaded`);
-    if (!plugin.enabled !== undefined && plugin.enabled === false) throw new Error(`Plugin ${pluginId} disabled`);
+    if (plugin.enabled === false) throw new Error(`Plugin ${pluginId} disabled`);
     return plugin;
   }
 
@@ -368,4 +369,4 @@ class P2PExchange {
   }
 }
 
-module.exports = { P2PExchange };
+export { P2PExchange };

@@ -1,8 +1,12 @@
-const abi = require('ethereumjs-abi');
-const axios = require('axios');
-const crypto = require('crypto');
-const { ecsign, keccak256, privateToAddress, setLengthLeft } = require('ethereumjs-util');
-const rlp = require('rlp');
+import axios from 'axios';
+import crypto from 'crypto';
+import { ecsign, privateToAddress, setLengthLeft } from '@ethereumjs/util';
+import { encode as rlpEncode } from '@ethereumjs/rlp';
+import { AbiCoder, Interface } from 'ethers';
+import { keccak256 } from 'ethers';
+import { compileHTLC as compileHTLCImpl } from './contracts/index.js';
+
+const ABI = AbiCoder.defaultAbiCoder();
 
 function hexBuf(hex) {
   let h = String(hex).replace(/^0x/i, '');
@@ -24,7 +28,9 @@ function hexify(buf) {
 }
 
 function encodeCall(signature, ...args) {
-  return '0x' + abi.simpleEncode(signature, ...args).toString('hex');
+  const name = signature.slice(0, signature.indexOf('('));
+  const iface = new Interface([`function ${signature}`]);
+  return iface.encodeFunctionData(name, args);
 }
 
 function weiToDec(wei, decimals = 18) {
@@ -36,8 +42,8 @@ function weiToDec(wei, decimals = 18) {
 }
 
 function htlcDeployData(receiver, hashlockHex, timelock, bytecode) {
-  const ctorArgs = abi.rawEncode(['address', 'bytes32', 'uint256'], [receiver, '0x' + hashlockHex, Number(timelock)]);
-  return '0x' + bytecode + ctorArgs.toString('hex');
+  const ctorArgs = ABI.encode(['address', 'bytes32', 'uint256'], [receiver, '0x' + hashlockHex, BigInt(timelock)]);
+  return '0x' + bytecode + ctorArgs.slice(2);
 }
 
 function createClient(url, timeoutMs = 20000) {
@@ -82,7 +88,7 @@ function createWallet(privKeyHex) {
     const toBuf = to ? hexBuf(to) : Buffer.alloc(0);
     const dataBuf = data ? hexBuf(data) : Buffer.alloc(0);
     const pre = [bigBuf(nonce), bigBuf(gasPrice), bigBuf(gas), toBuf, bigBuf(value), dataBuf, bigBuf(chainId), bigBuf(0n), bigBuf(0n)];
-    const hash = keccak256(rlp.encode(pre));
+    const hash = keccak256(rlpEncode(pre));
     const sig = ecsign(hash, pk);
     const v = chainId * 2n + 35n + BigInt(sig.v) - 27n;
     const signed = [
@@ -123,7 +129,7 @@ async function readHTLC(client, contract) {
 }
 
 function compileHTLC() {
-  return require('./contracts').compileHTLC();
+  return compileHTLCImpl();
 }
 
 function makeEVMPlugin({
@@ -177,7 +183,7 @@ function makeEVMPlugin({
   return plugin;
 }
 
-module.exports = {
+export {
   hexBuf, bigBuf, hexify, encodeCall, weiToDec, htlcDeployData,
   createClient, createWallet, walletSend, readHTLC, compileHTLC, makeEVMPlugin,
 };

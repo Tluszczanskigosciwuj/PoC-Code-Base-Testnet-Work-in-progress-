@@ -1,7 +1,8 @@
-const crypto = require('crypto');
+import crypto from 'crypto';
+import { load } from './modules/index.js';
 
 const ASSET = process.env.REFUND_ASSET || 'POL';
-const plugins = require('./modules').load();
+const plugins = load();
 const plugin = plugins[ASSET];
 if (!plugin) throw new Error('plugin ' + ASSET + ' not found in src/vm/modules');
 
@@ -105,11 +106,11 @@ async function runRefund() {
   process.exitCode = fails ? 1 : 0;
 }
 
-if (require.main === module) {
+if (import.meta.url === `file://${process.argv[1]}`) {
   runRefund().catch((e) => {
     console.error('Refund error:', e.code || '', e.message);
     process.exitCode = 1;
   });
 }
 
-module.exports = { runRefund };
+export { runRefund };

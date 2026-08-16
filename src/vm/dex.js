@@ -1,24 +1,32 @@
-const abi = require('ethereumjs-abi');
-const BN = require('bn.js');
-const Block = require('ethereumjs-block');
-const crypto = require('crypto');
-const { hashTransaction, ZERO_HASH, calculateMiningReward, computeStateRoot, computeContractStateRoot } = require('../crypto');
-const { compileHTLC, compileLPMarket, compileCcPool } = require('./contracts');
-const pluginRegistry = require('./modules');
+import { BN } from 'bn.js';
+import { Block } from '@ethereumjs/block';
+import crypto from 'crypto';
+import { AbiCoder, Interface, id } from 'ethers';
+import { hashTransaction, ZERO_HASH, calculateMiningReward, computeStateRoot, computeContractStateRoot } from '../crypto.js';
+import { compileHTLC, compileLPMarket, compileCcPool } from './contracts/index.js';
+import pluginRegistry from './modules/index.js';
 
 const WEI = 10n ** 18n;
 const FEE = 21000n;
+const ABI = AbiCoder.defaultAbiCoder();
 
 function evmAddress(systemAddress) {
   return '0x' + systemAddress.replace(/^0x/i, '').slice(2);
 }
 
 function encodeCall(signature, ...args) {
-  return '0x' + abi.simpleEncode(signature, ...args).toString('hex');
+  const name = signature.slice(0, signature.indexOf('('));
+  const iface = new Interface([`function ${signature}`]);
+  const normalizedArgs = args.map(a => {
+    if (typeof a === 'bigint') return a;
+    if (a && typeof a.toString === 'function') return a.toString();
+    return a;
+  });
+  return iface.encodeFunctionData(name, normalizedArgs);
 }
 
 function selector(name) {
-  return '0x' + abi.methodID(name, []).toString('hex');
+  return id(`${name}()`).slice(0, 10);
 }
 
 function pad32(hex) {
@@ -76,12 +84,13 @@ function ccTx(chain, from, to, value, nonce, data, ts) {
 }
 
 function htlcInit(receiver, hashlock, timelock) {
-  const ctorArgs = abi.rawEncode(['address', 'bytes32', 'uint256'], [evmAddress(receiver), '0x' + hashlock, timelock]);
-  return '0x' + compileHTLC() + ctorArgs.toString('hex');
+  const ctorArgs = ABI.encode(['address', 'bytes32', 'uint256'], [evmAddress(receiver), '0x' + hashlock, BigInt(timelock)]);
+  return '0x' + compileHTLC() + ctorArgs.slice(2);
 }
 
+import { privateToAddress } from '@ethereumjs/util';
+
 function ccFromEthKey(privKeyHex) {
-  const { privateToAddress } = require('ethereumjs-util');
   return '0xcc' + privateToAddress(Buffer.from(String(privKeyHex).replace(/^0x/i, ''), 'hex')).toString('hex');
 }
 
@@ -115,7 +124,10 @@ function createDex(opts) {
   let pool = (opts.pool || '').toLowerCase();
   let poolToken = (opts.poolToken || '').toLowerCase();
   const viewSender = () => reader || market || '0xcc' + '0'.repeat(40);
-  const balanceOf = (addr) => BigInt(db.prepare('SELECT balance FROM users WHERE lower(address) = lower(?)').get(addr).balance);
+  const balanceOf = (addr) => {
+    const row = db.prepare('SELECT balance FROM users WHERE lower(address) = lower(?)').get(addr);
+    return row ? BigInt(row.balance) : 0n;
+  };
 
   const dex = {
     chain, sc, db, WEI, FEE,
@@ -315,8 +327,8 @@ function createDex(opts) {
       poolToken = String(token).toLowerCase();
       reader = reader || from.toLowerCase();
       const t = ++ts;
-      const ctorArgs = abi.rawEncode(['address', 'uint256'], [evmAddress(poolToken), bn(feeBps == null ? 30 : feeBps)]);
-      await dex.add(ccTx(chain, from, '', 0, nonce, '0x' + compileCcPool() + ctorArgs.toString('hex'), t), t);
+      const ctorArgs = ABI.encode(['address', 'uint256'], [evmAddress(poolToken), bn(feeBps == null ? 30 : feeBps)]);
+      await dex.add(ccTx(chain, from, '', 0, nonce, '0x' + compileCcPool() + ctorArgs.slice(2), t), t);
       return pool;
     },
 
@@ -498,7 +510,7 @@ function createDex(opts) {
   return dex;
 }
 
-module.exports = {
+export {
   createDex, WEI, FEE, evmAddress, encodeCall, blockAt, readUint, decodeWords, htlcInit, ccTx, makeBlock,
   ccFromEthKey, formatAmount, bn, DEFAULT_TX_OPTS,
 };
