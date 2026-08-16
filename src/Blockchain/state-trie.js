@@ -98,23 +98,18 @@ class SparseMerkleTrie {
   }
 
   static verifyProof(root, key, value, proof, leafIndex) {
-    // Support both old format (proof array) and new format (object with proof + leafIndex)
     let proofArray = proof;
     let idx = leafIndex;
     
     if (Array.isArray(proof)) {
       idx = proof.leafIndex;
     } else if (proof && typeof proof === 'object' && proof.proof) {
-      // New format from getProof()
       proofArray = proof.proof;
       idx = proof.leafIndex;
     } else if (typeof leafIndex !== 'number') {
-      // Fallback: try to derive from key bits (legacy, may not match)
       const path = (typeof key !== 'string' || key.length !== 64) 
         ? key.toString(16).padStart(64, '0') 
         : key;
-      // Can't reliably derive index from key without knowing tree structure
-      // This fallback is kept for backward compatibility but may produce incorrect results
       console.warn('SparseMerkleTrie.verifyProof: legacy bit-based verification used; may not match getProof()');
       let current = value;
       for (let i = 0; i < proofArray.length; i++) {
@@ -129,7 +124,6 @@ class SparseMerkleTrie {
       return current === root;
     }
     
-    // Position-based verification (consistent with getProof)
     let current = value;
     for (let i = 0; i < proofArray.length; i++) {
       const sibling = proofArray[i];
