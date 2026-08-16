@@ -25,18 +25,31 @@ function isTty() {
   return Boolean(process.stdin && process.stdin.isTTY);
 }
 
-function download(url) {
+function download(url, redirectCount = 0) {
+  const MAX_REDIRECTS = 5;
+  const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const transport = u.protocol === 'https:' ? https : http;
     transport.get(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        return download(new URL(res.headers.location, u).toString()).then(resolve, reject);
+        if (redirectCount >= MAX_REDIRECTS) {
+          return reject(new Error('Too many redirects'));
+        }
+        return download(new URL(res.headers.location, u).toString(), redirectCount + 1).then(resolve, reject);
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let totalSize = 0;
+      res.on('data', (c) => {
+        totalSize += c.length;
+        if (totalSize > MAX_SIZE) {
+          res.destroy();
+          return reject(new Error('Download too large'));
+        }
+        chunks.push(c);
+      });
       res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject);
   });

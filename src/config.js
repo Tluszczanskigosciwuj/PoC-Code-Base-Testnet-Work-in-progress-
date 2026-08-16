@@ -164,7 +164,7 @@ function normalizeSeedPeers(value) {
 }
 
 function saveConfig(cfg) {
-  const sensitive = new Set(['minerPrivateKey', 'adminToken', 'privateKey']);
+  const sensitive = new Set(['minerPrivateKey', 'adminToken']);
   const safe = {};
   for (const [k, v] of Object.entries(cfg)) { if (!sensitive.has(k)) safe[k] = v; }
   try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(safe, null, 2)); } catch (e) { log('warn', `Config save failed: ${e.message}`); }

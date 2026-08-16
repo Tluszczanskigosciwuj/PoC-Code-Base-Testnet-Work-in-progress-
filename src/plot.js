@@ -2,6 +2,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { sha256hex, sha256buf, merkleRootBuf2, computeMerkleProofBuf2, computeMerkleTreeNodes, merkleTreeInternalNodeCount, computeDeadline, plotScoopCount, SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, ZERO_HASH, PLOT_FORMAT_V3 } = require('./crypto');
 const { log } = require('./config');
+const MAX_PLOT_GB = 10240; // 10 TB cap
 
 const HEADER_SIZE = 256;
 
@@ -142,6 +143,7 @@ function generateV3Scoops(accountId, nonce, count) {
 }
 
 function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
+  if (sizeGb > MAX_PLOT_GB) throw new Error(`Plot size ${sizeGb} GB exceeds maximum ${MAX_PLOT_GB} GB`);
   const totalScoops = plotScoopCount(sizeGb);
   if (totalScoops < 1) return null;
 
@@ -165,32 +167,33 @@ function createPlotFile(plotPath, plotId, minerAddress, sizeGb, accountId) {
   const root = treeNodes.subarray(-32).toString('hex') || ZERO_HASH;
 
   const plotSize = plotTotalSize(totalScoops);
-  const buf = Buffer.alloc(plotSize);
+  const fd = fs.openSync(plotPath, 'w');
+  try {
+    const header = Buffer.alloc(HEADER_SIZE);
+    header.write('CHOCOHUB', 0, 'ascii');
+    header.writeUInt32LE(PLOT_FORMAT_V3, 8);
+    const idHigh = parseInt(plotId.slice(0, 8), 16) || 0;
+    const idLow = parseInt(plotId.slice(8, 16), 16) || 0;
+    header.writeUInt32LE(idHigh, 12);
+    header.writeUInt32LE(idLow, 16);
+    header.write(minerAddress.padEnd(44, '\0'), 20, 44, 'ascii');
+    header.writeUInt32LE(totalScoops, 64);
+    header.writeUInt32LE(SCOOP_SIZE, 68);
+    header.write(root, 72, 64, 'hex');
+    accountId.copy(header, 104);
+    fs.writeSync(fd, header, 0, HEADER_SIZE, 0);
 
-  buf.write('CHOCOHUB', 0, 'ascii');
-  buf.writeUInt32LE(PLOT_FORMAT_V3, 8);
-  const idHigh = parseInt(plotId.slice(0, 8), 16) || 0;
-  const idLow = parseInt(plotId.slice(8, 16), 16) || 0;
-  buf.writeUInt32LE(idHigh, 12);
-  buf.writeUInt32LE(idLow, 16);
-  buf.write(minerAddress.padEnd(44, '\0'), 20, 44, 'ascii');
-  buf.writeUInt32LE(totalScoops, 64);
-  buf.writeUInt32LE(SCOOP_SIZE, 68);
-  buf.write(root, 72, 64, 'hex');
-  accountId.copy(buf, 104);
+    for (let n = 0; n < numNonces; n++) {
+      const nonceScoops = Math.min(scoopsPerNonce, totalScoops - n * scoopsPerNonce);
+      const scoopData = generateV3Scoops(accountId, n, nonceScoops);
+      fs.writeSync(fd, scoopData, 0, scoopData.length, HEADER_SIZE + n * scoopsPerNonce * SCOOP_SIZE);
+    }
 
-  let offset = HEADER_SIZE;
-  for (let n = 0; n < numNonces; n++) {
-    const nonceScoops = Math.min(scoopsPerNonce, totalScoops - n * scoopsPerNonce);
-    const scoopData = generateV3Scoops(accountId, n, nonceScoops);
-    scoopData.copy(buf, offset);
-    offset += nonceScoops * 32;
+    fs.writeSync(fd, treeNodes, 0, treeNodes.length, HEADER_SIZE + totalScoops * SCOOP_SIZE);
+  } finally {
+    fs.closeSync(fd);
   }
-
-  treeNodes.copy(buf, HEADER_SIZE + totalScoops * 32);
-
-  fs.writeFileSync(plotPath, buf);
   return { plotId, sizeGb, totalScoops, merkleRoot: root, accountId: accountId.toString('hex') };
 }
 
-module.exports = { buildPocProof, computePlotMerkleRoot, createPlotFile, detectPlotFormat, computeAccountId, generateV3Scoops };
+module.exports = { buildPocProof, computePlotMerkleRoot, createPlotFile, detectPlotFormat, computeAccountId, generateV3Scoops, MAX_PLOT_GB };

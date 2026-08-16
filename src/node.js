@@ -77,7 +77,8 @@ class ChocoNode {
     this.smartContracts = null;
     if (cfg.smartContractsEnabled) {
       try {
-        this.smartContracts = require('./vm/smartcontracts');
+        const SC = require('./vm/smartcontracts');
+        this.smartContracts = SC;
         this.smartContracts.setDatabase(this.db);
         log('info', `Smart contracts (EVM) enabled`);
       } catch (e) {
@@ -104,6 +105,7 @@ class ChocoNode {
       this.p2pWsServer = new P2PWebSocketServer(cfg.p2pWsPort, this.chain, this.sync, this.peers);
       await this.p2pWsServer.start();
       log('info', `[P2P-WS] WebSocket P2P server started on port ${cfg.p2pWsPort}`);
+      this.server.p2pWsServer = this.p2pWsServer;
     }
 
     setInterval(() => { try { this.peers.decayHealth(); } catch {} }, 300000);

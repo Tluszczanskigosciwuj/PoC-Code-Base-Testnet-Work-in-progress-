@@ -1,9 +1,8 @@
 const path = require('path');
 const crypto = require('crypto');
-const crypto2 = require('crypto');
 const { safeInt, safeBigInt, sha256hex, hashTransaction, pubkeyToAddress, pubKeyToAddress, calculateMiningReward, hashBlock, signMessage, canonicalTxMessage } = require('./crypto');
 const { log, getLogBuffer } = require('./config');
-const { createPlotFile } = require('./plot');
+const { createPlotFile, MAX_PLOT_GB } = require('./plot');
 
 const rateLimitStore = new Map();
 function rateLimit(options = {}) {
@@ -91,7 +90,6 @@ class Server {
     const app = express();
     this.app = app;
 
-    const path = require('path');
     const PUBLIC_DIR = path.join(__dirname, 'public');
 
     app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
@@ -373,7 +371,7 @@ class Server {
       if (!address || !plot_id || !size_gb) return res.status(400).json({ error: 'miner address, plot_id, size_gb required' });
       try {
         const size = parseFloat(size_gb);
-        if (size <= 0 || size > 1e9) return res.status(400).json({ error: 'invalid size_gb' });
+        if (size <= 0 || size > MAX_PLOT_GB) return res.status(400).json({ error: `invalid size_gb (1-${MAX_PLOT_GB} GB)` });
         const plotPath = path.join(plot_dir || this.cfg.plotsDir, `${plot_id}.plot`);
         const plotInfo = createPlotFile(plotPath, plot_id, address, size);
         this.db.prepare('INSERT OR IGNORE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, created_at) VALUES (?,?,?,?,?)').run(plot_id, address, plotInfo.merkleRoot, size, Math.floor(Date.now() / 1000));
@@ -458,8 +456,8 @@ class Server {
         const pkHex = String(private_key).startsWith('0x') ? String(private_key).slice(2) : String(private_key);
         const key = Buffer.from(pkHex, 'hex');
         const prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
-        const privKeyObj = crypto2.createPrivateKey({ key: Buffer.concat([prefix, key]), format: 'der', type: 'pkcs8' });
-        const pubKeyObj = crypto2.createPublicKey(privKeyObj);
+        const privKeyObj = crypto.createPrivateKey({ key: Buffer.concat([prefix, key]), format: 'der', type: 'pkcs8' });
+        const pubKeyObj = crypto.createPublicKey(privKeyObj);
         const pubB64 = pubKeyObj.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64');
         const from_addr = sender || pubkeyToAddress(pubB64);
         const now = Math.floor(Date.now() / 1000);
@@ -475,10 +473,9 @@ class Server {
 const validation = await this.chain.validateTxForMempool(tx);
         if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
         const result = this.chain.addMempoolTx(tx);
-if (result.ok) {
+        if (!result.ok) return res.status(400).json({ ok: false, error: result.motivo || 'failed to add transaction' });
         setImmediate(() => this.sync.broadcastTx(tx));
         if (this.p2pWsServer) this.p2pWsServer.broadcastTx(tx);
-      }
         res.json({ ok: true, mode: 'tx', hash: tx.hash, from: from_addr });
         log('info', `[SMART CONTRACTS] Executed contract tx: address=${address}, sender=${from_addr}, tx=${tx.hash}`);
       } catch (e) {
@@ -599,28 +596,26 @@ if (result.ok) {
     app.post('/api/node/broadcast/block', p2pLimiter, async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
-      const extendTip = safeInt(block.height, 0) > this.chain.height;
-      const minerPk = block.miner ? this.chain.db.prepare('SELECT 1 FROM users WHERE lower(address) = lower(?) AND public_key_ed25519 IS NOT NULL AND public_key_ed25519 != ""').get(block.miner) : null;
       const result = await this.chain.addBlock(block, {
         skipPocValidation: false,
         skipSignature: false,
         skipTargetValidation: false,
         skipStateValidation: false,
         skipHashValidation: false,
-        forceSync: extendTip,
+        forceSync: false,
       });
       log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} height=${this.chain.height}`);
       res.json(result);
     });
 
-    app.post('/api/node/broadcast/tx', p2pLimiter, (req, res) => {
+    app.post('/api/node/broadcast/tx', p2pLimiter, async (req, res) => {
       const tx = req.body.tx;
       if (!tx) return res.status(400).json({ error: 'tx required' });
-      const validation = this.chain.validateTxForMempool(tx);
+      const validation = await this.chain.validateTxForMempool(tx);
       if (!validation.ok) return res.status(400).json({ ok: false, error: validation.motivo });
       const result = this.chain.addMempoolTx(tx);
-      log('info', `[TX] Mempool tx: miner=${tx.miner}, plot_id=${tx.plot_id}, deadline=${tx.deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
-if (result.ok && result.motivo !== 'Tx already in mempool') {
+      log('info', `[TX] Mempool tx: hash=${tx.hash ? tx.hash.slice(0,10) : 'unknown'}, from=${tx.from_addr}, nonce=${tx.nonce}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
+      if (result.ok && result.motivo !== 'Tx already in mempool') {
         const relayHops = safeInt(tx.relay_hops, 0);
         if (relayHops < 2) {
           setImmediate(() => this.sync.broadcastTx({ ...tx, relay_hops: relayHops + 1 }));
