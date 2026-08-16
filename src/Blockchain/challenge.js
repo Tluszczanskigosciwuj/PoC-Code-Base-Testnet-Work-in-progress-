@@ -28,7 +28,7 @@ class ChallengeManager {
     const expired = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ? AND forged_block_height IS NULL AND expires_at <= ? AND challenge_id IN (SELECT DISTINCT challenge_id FROM challenge_submissions)').get(challengeId, now);
     if (expired) return { ...expired, base_target: baseTarget };
     const minTtl = Math.max(this.cfg.challengeTtlSec || 300, (this.cfg.expectedTimePerBlock || 240) * 5);
-    const ttl = Math.max(minTtl, 86400);
+    const ttl = Math.min(Math.max(minTtl, 60), 86400);
     this.db.prepare('DELETE FROM mining_challenges WHERE forged_block_height IS NULL AND (challenge_id != ? OR expires_at + ? < ?) AND challenge_id NOT IN (SELECT DISTINCT challenge_id FROM challenge_submissions)').run(challengeId, challengeGrace, now);
     this.db.prepare('DELETE FROM mining_challenges WHERE challenge_id = ? AND (forged_block_height IS NOT NULL OR expires_at < ?)').run(challengeId, now - challengeGrace);
     const nonce = crypto.randomBytes(4).toString('hex');
@@ -60,7 +60,6 @@ class ChallengeManager {
     }
     if (!proofPacket || !proofPacket.scoop_data) return { ok: false, motivo: 'proof_packet with scoop_data required for PoC verification' };
     const genSig = ch.challenge_seed || ZERO_HASH;
-    const parentBlock = chain.getBlock(ch.block_height || chain.height);
     const networkBaseTarget = chain._baseTargetForHeight(ch.block_height || chain.height);
     const computedDeadline = Math.min(computeDeadline(proofPacket.scoop_data, genSig, sizeGb, networkBaseTarget), maxDl);
     if (Math.abs(computedDeadline - deadline) > 1) return { ok: false, motivo: `PoC verification failed: computed ${computedDeadline}s, submitted ${deadline}s` };
@@ -235,17 +234,31 @@ class ChallengeManager {
       const nextHeight = chain.height + 1;
       const existing = this.db.prepare('SELECT hash, challenge_id FROM blocks WHERE height = ? LIMIT 1').get(nextHeight);
       if (existing) return null;
-      const submissions = this.db.prepare('SELECT * FROM challenge_submissions WHERE challenge_id = ? ORDER BY deadline ASC').all(challenge.challenge_id);
+      const submissions = this.db.prepare('SELECT * FROM challenge_submissions WHERE challenge_id = ?').all(challenge.challenge_id);
       if (!submissions.length) return null;
       const maxDl = chain.computeMaxDeadline();
       const seenSub = new Set();
       const validSubs = submissions
-        .filter(s => s.deadline <= maxDl)
+        .filter(s => safeInt(s.deadline, maxDl + 1) <= maxDl)
         .filter(s => {
-          const k = `${(s.miner || '').toLowerCase()}:${s.plot_id || ''}:${s.deadline}`;
+          const k = `${(s.miner || '').toLowerCase()}:${s.plot_id || ''}:${safeInt(s.deadline, -1)}`;
           if (seenSub.has(k)) return false;
           seenSub.add(k);
           return true;
+        })
+        .sort((a, b) => {
+          const da = safeInt(a.deadline, Number.MAX_SAFE_INTEGER);
+          const dbd = safeInt(b.deadline, Number.MAX_SAFE_INTEGER);
+          if (da !== dbd) return da - dbd;
+          const ma = String(a.miner || '').toLowerCase();
+          const mb = String(b.miner || '').toLowerCase();
+          if (ma !== mb) return ma < mb ? -1 : 1;
+          const pa = String(a.plot_id || '');
+          const pb = String(b.plot_id || '');
+          if (pa !== pb) return pa < pb ? -1 : 1;
+          const sa = String(a.proof_digest || '');
+          const sb = String(b.proof_digest || '');
+          return sa < sb ? -1 : sa > sb ? 1 : 0;
         });
       if (!validSubs.length) return null;
       const winner = validSubs[0];
@@ -268,7 +281,7 @@ class ChallengeManager {
       let allocated = 0n;
       for (const { sub, score } of scores) {
         const poolPct = totalScore > 0 ? (score / totalScore) * poolSharePct : 0;
-        const isWinner = sub.miner === winner.miner && sub.deadline === winner.deadline && sub.plot_id === winner.plot_id;
+        const isWinner = String(sub.miner || '').toLowerCase() === String(winner.miner || '').toLowerCase() && safeInt(sub.deadline, -1) === safeInt(winner.deadline, -1) && String(sub.plot_id || '') === String(winner.plot_id || '');
         const finalPct = isWinner ? (poolPct + winnerSharePct) : poolPct;
         const permille = BigInt(Math.round(finalPct * 1000));
         const reward = (totalReward * permille) / 100000n;

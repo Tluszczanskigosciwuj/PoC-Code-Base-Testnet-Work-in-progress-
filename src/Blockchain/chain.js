@@ -1,10 +1,10 @@
-const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS } = require('../crypto');
-const { IncrementalStateRoot } = require('./state-trie');
-const { hashBlockAsync, verifySignatureAsync, canonicalTxMessageAsync } = require('../worker-pool');
-const { estimateIntrinsicGas, nextBaseFee, GAS_PARAMS } = require('../consensus/gas');
-const { log } = require('../config');
-const BN = require('bn.js');
-const Block = require('ethereumjs-block');
+import { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS } from '../crypto.js';
+import { IncrementalStateRoot } from './state-trie.js';
+import { hashBlockAsync, verifySignatureAsync, canonicalTxMessageAsync } from '../worker-pool.js';
+import { estimateIntrinsicGas, nextBaseFee, GAS_PARAMS } from '../consensus/gas.js';
+import { log } from '../config.js';
+import { Block } from '@ethereumjs/block';
+import BN from 'bn.js';
 
 const FINALIZATION_DEPTH = 30;
 function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; }
@@ -241,8 +241,9 @@ class Chain {
   if (height === 0) return GAS_PARAMS.initialBaseFee;
   const parent = this.db.prepare('SELECT base_fee, gas_used FROM blocks WHERE height = ?').get(height - 1);
   if (!parent) return GAS_PARAMS.initialBaseFee;
+  const parentBaseFee = parent.base_fee != null && parent.base_fee !== '' ? BigInt(parent.base_fee) : BigInt(GAS_PARAMS.initialBaseFee);
     return String(nextBaseFee(
-      BigInt(parent.base_fee) || BigInt(GAS_PARAMS.initialBaseFee),
+      parentBaseFee,
       parent.gas_used || 0,
       GAS_PARAMS.blockGasLimit / 2,
       this.cfg.minGasPrice
@@ -471,9 +472,7 @@ class Chain {
             throw new Error('contract_state_root mismatch');
           }
         }
-        const contractTxs = txs.filter(t => this._isContractOp(t));
-        const contractAddresses = [...new Set(contractTxs.map(t => t.to_addr || this.contracts.deriveContractAddress(t.from_addr, safeInt(t.nonce, 0))).filter(Boolean))];
-        if (contractAddresses.length) this._recordContractStateChanges(height, bloco.hash, contractAddresses);
+        if (contractExec && contractExec.backup && contractExec.backup.length) this._recordContractStateChanges(height, bloco.hash, contractExec.backup);
         this._selectTip();
       })();
       if (height > 0) log('info', `Block #${height} accepted [${bloco.hash.slice(0, 10)}] from ${blockOrigin} (miner: ${(bloco.miner || '').slice(0, 10)}…)`);
@@ -526,23 +525,39 @@ class Chain {
     if (this.contracts && this.contracts.clearVmCache) this.contracts.clearVmCache();
   }
 
-  _recordContractStateChanges(blockHeight, blockHash, contractAddresses) {
+  _recordContractStateChanges(blockHeight, blockHash, snapshots) {
     const now = Math.floor(Date.now() / 1000);
-    for (const addr of contractAddresses) {
-      const storage = this.db.prepare('SELECT * FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').all(addr);
-      for (const row of storage) {
+    for (const snap of snapshots || []) {
+      const addr = String(snap.address || '').toLowerCase();
+      if (!addr) continue;
+      const currentStorageRows = this.db.prepare('SELECT * FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').all(addr);
+      const prevStorage = new Map((snap.storage || []).map(r => [String(r.slot), (r.value == null ? '' : String(r.value))]));
+      const nextStorage = new Map(currentStorageRows.map(r => [String(r.slot), (r.value == null ? '' : String(r.value))]));
+      const slots = new Set([...prevStorage.keys(), ...nextStorage.keys()]);
+      for (const slot of slots) {
+        const prevValue = prevStorage.has(slot) ? prevStorage.get(slot) : '';
+        const newValue = nextStorage.has(slot) ? nextStorage.get(slot) : '';
         this.db.prepare(`
           INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
           VALUES (?,?,?,?,?,?,?)
-        `).run(row.contract_address, row.slot, row.value, row.value, blockHeight, blockHash, now);
+        `).run(addr, slot, prevValue, newValue, blockHeight, blockHash, now);
       }
-      const account = this.db.prepare('SELECT * FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(addr);
-      if (account) {
-        this.db.prepare(`
-          INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
-          VALUES (?,?,?,?,?,?,?)
-        `).run(account.address, '__balance__', account.balance, account.balance, blockHeight, blockHash, now);
-      }
+
+      const prevAccount = snap.account ? (snap.account.balance == null ? '' : String(snap.account.balance)) : '';
+      const nextAccountRow = this.db.prepare('SELECT * FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(addr);
+      const nextAccount = nextAccountRow ? (nextAccountRow.balance == null ? '' : String(nextAccountRow.balance)) : '';
+      this.db.prepare(`
+        INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
+        VALUES (?,?,?,?,?,?,?)
+      `).run(addr, '__balance__', prevAccount, nextAccount, blockHeight, blockHash, now);
+
+      const prevContract = snap.contract ? JSON.stringify(snap.contract) : '';
+      const nextContractRow = this.db.prepare('SELECT * FROM smart_contracts WHERE lower(address) = lower(?)').get(addr);
+      const nextContract = nextContractRow ? JSON.stringify(nextContractRow) : '';
+      this.db.prepare(`
+        INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
+        VALUES (?,?,?,?,?,?,?)
+      `).run(addr, '__contract__', prevContract, nextContract, blockHeight, blockHash, now);
     }
   }
 
@@ -559,11 +574,25 @@ class Chain {
         const key = c.slot;
         if (seen.has(key)) continue;
         seen.add(key);
-        if (c.prev_value === null || c.prev_value === '') {
-          this.db.prepare('DELETE FROM smart_contract_storage WHERE lower(contract_address) = lower(?) AND slot = ?').run(addr, c.slot);
-          this.db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(addr);
+        if (c.slot === '__contract__') {
+          if (c.prev_value === null || c.prev_value === '') {
+            this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(addr);
+          } else {
+            try {
+              const prev = JSON.parse(c.prev_value);
+              this.db.prepare('INSERT OR REPLACE INTO smart_contracts (address, creator, code, created_at, updated_at) VALUES (?,?,?,?,?)').run(prev.address, prev.creator, prev.code, prev.created_at, prev.updated_at);
+            } catch {
+              this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(addr);
+            }
+          }
         } else if (c.slot === '__balance__') {
-          this.db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?,?)').run(addr, c.prev_value);
+          if (c.prev_value === null || c.prev_value === '') {
+            this.db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(addr);
+          } else {
+            this.db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?,?)').run(addr, c.prev_value);
+          }
+        } else if (c.prev_value === null || c.prev_value === '') {
+          this.db.prepare('DELETE FROM smart_contract_storage WHERE lower(contract_address) = lower(?) AND slot = ?').run(addr, c.slot);
         } else {
           this.db.prepare('INSERT OR REPLACE INTO smart_contract_storage (contract_address, slot, value) VALUES (?,?,?)').run(addr, c.slot, c.prev_value);
         }
@@ -662,7 +691,7 @@ class Chain {
           }
         }
       }
-      return { ok: true, rollback: () => this._restoreContractState(backup), payouts };
+      return { ok: true, rollback: () => this._restoreContractState(backup), payouts, backup };
     } catch (e) {
       this._restoreContractState(backup);
       return { ok: false, motivo: e.message || 'contract execution error', rollback: () => {}, payouts: [] };
@@ -796,17 +825,6 @@ async validateTxForMempool(tx) {
       current = this.getBlock(current.parent_hash);
     }
     hashes.reverse();
-    let oldWalker = oldTip;
-    while (oldWalker && oldWalker.height > forkPoint.height) {
-      if (oldWalker.height <= target.height && oldWalker.miner && oldWalker.miner !== 'genesis') {
-        const reward = BigInt(oldWalker.reward_cc || '0');
-        if (reward > 0n) {
-          const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(oldWalker.miner);
-          if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) - reward), Math.floor(Date.now() / 1000), oldWalker.miner);
-        }
-      }
-      oldWalker = this.getBlock(oldWalker.parent_hash);
-    }
     for (const h of hashes) {
       let blk = this.getBlockByHash(h);
       if (!blk) {
@@ -816,11 +834,15 @@ async validateTxForMempool(tx) {
       const res = await this._insertBlockDirect(blk);
       if (!res.ok) return { ok: false, motivo: res.motivo };
     }
-    this._selectTip();
-    this._purgeOrphanedDescendants(forkPoint.height, target.height);
-    this._purgeOrphanedBlocks();
-    this._restoreContractStateFromHistory(forkPoint.height);
-    this._recomputeBalances();
+    const finalizeReorg = this.db.transaction(() => {
+      this._selectTip();
+      this._purgeOrphanedDescendants(forkPoint.height, target.height);
+      this._purgeOrphanedBlocks();
+      this._restoreContractStateFromHistory(forkPoint.height);
+      this._recomputeBalances();
+      this._selectTip();
+    });
+    finalizeReorg();
     log('info', `Reorg to #${this.height} ${this.bestHash.slice(0, 10)} (depth ${depth})`);
     return { ok: true, motivo: 'reorganized', height: this.height, hash: this.bestHash };
   }
@@ -968,6 +990,9 @@ async validateTxForMempool(tx) {
             else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(blk.miner, String(reward), 0, now, now);
           }
         }
+        if (contractExec && contractExec.backup && contractExec.backup.length) {
+          this._recordContractStateChanges(blk.height, blk.hash, contractExec.backup);
+        }
       })();
       return { ok: true };
     } catch (e) {
@@ -1027,4 +1052,4 @@ async validateTxForMempool(tx) {
 
 }
 
-module.exports = { Chain, FINALIZATION_DEPTH };
+export { Chain, FINALIZATION_DEPTH };

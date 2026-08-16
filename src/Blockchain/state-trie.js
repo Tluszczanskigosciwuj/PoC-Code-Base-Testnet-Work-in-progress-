@@ -74,7 +74,7 @@ class SparseMerkleTrie {
     const path = this._getPath(key);
     const paths = Array.from(this.leaves.keys()).sort();
     const idx = paths.indexOf(path);
-    if (idx === -1) return [];
+    if (idx === -1) { const empty = []; empty.leafIndex = -1; return empty; }
     
     const proof = [];
     let levelPaths = paths;
@@ -93,23 +93,52 @@ class SparseMerkleTrie {
       levelIdx = Math.floor(levelIdx / 2);
     }
     
+    proof.leafIndex = idx;
     return proof;
   }
 
-  static verifyProof(root, key, value, proof) {
-    let current = value;
-    const path = (typeof key !== 'string' || key.length !== 64) 
-      ? key.toString(16).padStart(64, '0') 
-      : key;
+  static verifyProof(root, key, value, proof, leafIndex) {
+    // Support both old format (proof array) and new format (object with proof + leafIndex)
+    let proofArray = proof;
+    let idx = leafIndex;
     
-    for (let i = 0; i < proof.length; i++) {
-      const sibling = proof[i];
-      const bit = path[path.length - 1 - i];
-      if (bit === '0') {
+    if (Array.isArray(proof)) {
+      idx = proof.leafIndex;
+    } else if (proof && typeof proof === 'object' && proof.proof) {
+      // New format from getProof()
+      proofArray = proof.proof;
+      idx = proof.leafIndex;
+    } else if (typeof leafIndex !== 'number') {
+      // Fallback: try to derive from key bits (legacy, may not match)
+      const path = (typeof key !== 'string' || key.length !== 64) 
+        ? key.toString(16).padStart(64, '0') 
+        : key;
+      // Can't reliably derive index from key without knowing tree structure
+      // This fallback is kept for backward compatibility but may produce incorrect results
+      console.warn('SparseMerkleTrie.verifyProof: legacy bit-based verification used; may not match getProof()');
+      let current = value;
+      for (let i = 0; i < proofArray.length; i++) {
+        const sibling = proofArray[i];
+        const bit = path[path.length - 1 - i];
+        if (bit === '0') {
+          current = hashPair(current, sibling);
+        } else {
+          current = hashPair(sibling, current);
+        }
+      }
+      return current === root;
+    }
+    
+    // Position-based verification (consistent with getProof)
+    let current = value;
+    for (let i = 0; i < proofArray.length; i++) {
+      const sibling = proofArray[i];
+      if (idx % 2 === 0) {
         current = hashPair(current, sibling);
       } else {
         current = hashPair(sibling, current);
       }
+      idx = Math.floor(idx / 2);
     }
     return current === root;
   }
