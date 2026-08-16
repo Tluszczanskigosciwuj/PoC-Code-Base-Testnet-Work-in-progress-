@@ -69,6 +69,7 @@ class P2PWebSocketServer {
 
   start() {
     return new Promise((resolve, reject) => {
+      this._startTime = Date.now();
       this.wss = new WebSocket.Server({ port: this.port });
       
       this.wss.on('listening', () => {
@@ -101,8 +102,12 @@ class P2PWebSocketServer {
           try {
             const msg = JSON.parse(data.toString());
             const handler = this._messageHandlers.get(msg.type);
-            if (handler) handler(ws, msg);
-            else ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }));
+            if (handler) {
+              Promise.resolve(handler(ws, msg)).catch((err) => {
+                log('warn', `[P2P-WS] Handler error for ${msg.type}: ${err.message}`);
+                try { ws.send(JSON.stringify({ type: 'error', message: err.message || 'Handler failed' })); } catch {}
+              });
+            } else ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }));
           } catch (e) {
             ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
           }
@@ -146,11 +151,22 @@ class P2PWebSocketServer {
     });
   }
 
+  _topicMatches(sub, type) {
+    if (sub === 'all' || sub === type) return true;
+    const aliases = {
+      new_block: ['blocks'],
+      blocks: ['new_block'],
+      new_tx: ['transactions'],
+      transactions: ['new_tx'],
+    };
+    return (aliases[type] || []).includes(sub) || (aliases[sub] || []).includes(type);
+  }
+
   broadcast(type, data, excludeWs = null) {
     const msg = JSON.stringify({ type, data, timestamp: Date.now() });
     for (const ws of this.wss.clients) {
       if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
-        if (!ws.subscriptions || ws.subscriptions.has(type) || ws.subscriptions.has('all')) {
+        if (!ws.subscriptions || Array.from(ws.subscriptions).some(sub => this._topicMatches(sub, type))) {
           ws.send(msg);
         }
       }
@@ -188,8 +204,10 @@ class P2PWebSocketServer {
 
   getStats() {
     const subs = new Map();
-    for (const [, { subscriptions }] of this.clients) {
-      for (const s of subscriptions) subs.set(s, (subs.get(s) || 0) + 1);
+    for (const [ws, _info] of this.clients) {
+      if (ws.subscriptions) {
+        for (const s of ws.subscriptions) subs.set(s, (subs.get(s) || 0) + 1);
+      }
     }
     return {
       connected: this.clients.size,
@@ -201,8 +219,10 @@ class P2PWebSocketServer {
   stop() {
     clearInterval(this._pingTimer);
     clearInterval(this._broadcastTimer);
-    for (const ws of this.wss.clients) ws.close();
-    this.wss.close();
+    if (this.wss) {
+      for (const ws of this.wss.clients) ws.close();
+      this.wss.close();
+    }
   }
 }
 
@@ -298,7 +318,7 @@ class P2PWebSocketClient {
       skipTargetValidation: false,
       skipStateValidation: false,
       skipHashValidation: false,
-      forceSync: block.height > this.chain.height
+      forceSync: false
     });
     
     if (result.ok) {
@@ -310,10 +330,12 @@ class P2PWebSocketClient {
     if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) return;
     if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) return;
     
-    const validation = this.chain.validateTxForMempool(tx);
+    const validation = await this.chain.validateTxForMempool(tx);
     if (validation.ok) {
-      this.chain.addMempoolTx(tx);
-      this.sync.broadcastTx(tx);
+      const result = this.chain.addMempoolTx(tx);
+      if (result.ok && result.motivo !== 'Tx already in mempool') {
+        this.sync.broadcastTx(tx);
+      }
     }
   }
 
@@ -329,7 +351,7 @@ class P2PWebSocketClient {
         skipTargetValidation: false,
         skipStateValidation: false,
         skipHashValidation: false,
-        forceSync: true
+        forceSync: false
       });
     }
   }

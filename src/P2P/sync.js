@@ -35,15 +35,29 @@ class SyncEngine {
     this.NODE_ID = NODE_ID;
     this.syncing = false;
     this._lastReorg = 0;
+    this._broadcastSeen = new Map();
+  }
+
+  _rememberBroadcast(key, ttlMs = 30000) {
+    const now = Date.now();
+    const expiry = this._broadcastSeen.get(key);
+    if (expiry && expiry > now) return false;
+    this._broadcastSeen.set(key, now + ttlMs);
+    if (this._broadcastSeen.size > 10000) {
+      for (const [k, v] of this._broadcastSeen.entries()) {
+        if (v <= now) this._broadcastSeen.delete(k);
+      }
+    }
+    return true;
   }
 
   async discoverPeers() {
     const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
     const targets = [...new Set([...(this.cfg.seedPeers || []), ...this.peers.active(20).map(p => p.url)])];
-    for (const url of targets) {
+    await Promise.allSettled(targets.map(async (url) => {
       try {
         const normalized = new (require('url').URL)(url);
-        if (selfHost && normalized.hostname === selfHost) continue;
+        if (selfHost && normalized.hostname === selfHost) return;
         const data = await fetchJSON(`${url.replace(/\/+$/, '')}/peers`, { timeout: 8 });
         log('info', `[P2P] Discovered peers from ${url}: ${data && Array.isArray(data.peers) ? data.peers.length + ' peers' : data}`);
         if (data && Array.isArray(data.peers) && data.peers.length > 0) {
@@ -54,7 +68,7 @@ class SyncEngine {
       } catch {
         this.peers.fail(url);
       }
-    }
+    }));
   }
 
   async loopSync() {
@@ -137,7 +151,7 @@ class SyncEngine {
       this.chain._purgeOrphanedBlocks();
       const peerTip = await fetchJSON(`${peerUrl}/api/block/${remoteHeight}`, { timeout: 5 });
       if (peerTip && peerTip.hash) {
-        const reorgResult = await this.chain.reorganize(peerTip, true);
+        const reorgResult = await this.chain.reorganize(peerTip, false);
         if (reorgResult.ok) {
           log('info', `Synced ${inserted} blocks from ${peerUrl}, reorged to #${reorgResult.height} ${(reorgResult.hash || '').slice(0, 10)}`);
         } else {
@@ -167,7 +181,7 @@ class SyncEngine {
     const peers = this.peers.active(20).filter(p => {
       try { const u = new (require('url').URL)(p.url); if (this.cfg.nodeUrl && u.hostname === new (require('url').URL)(this.cfg.nodeUrl).hostname) return false; } catch {} return true;
     });
-    for (const peer of peers) {
+    await Promise.allSettled(peers.map(async (peer) => {
       try {
         const stats = this.chain.getStats();
         const res = await fetchJSON(`${peer.url}/api/node/announce`, {
@@ -184,15 +198,15 @@ class SyncEngine {
           }
         }
       } catch { this.peers.fail(peer.url); }
-    }
+    }));
   }
 
   async announce() {
     if (!this.cfg.nodeUrl) return;
     const selfHost = (() => { try { return new (require('url').URL)(this.cfg.nodeUrl).hostname; } catch { return null; } })();
-    for (const seed of this.cfg.seedPeers || []) {
+    await Promise.allSettled((this.cfg.seedPeers || []).map(async (seed) => {
       try {
-        if (selfHost && new (require('url').URL)(seed).hostname === selfHost) continue;
+        if (selfHost && new (require('url').URL)(seed).hostname === selfHost) return;
         const stats = this.chain.getStats();
         log('info', `[P2P] Announcing to seed peer ${seed}: height=${this.chain.height}, chain_work=${stats.chain_work}, node_id=${this.NODE_ID}`);
         await fetchJSON(`${seed.replace(/\/+$/, '')}/register`, {
@@ -202,33 +216,28 @@ class SyncEngine {
           }, timeout: 8,
         });
       } catch { this.peers.fail(seed); }
-    }
+    }));
   }
 
   async broadcastBlock(block) {
+    const key = `block:${block && block.hash ? block.hash : hashBlock(block)}`;
+    if (!this._rememberBroadcast(key)) return { accepted: 0, total: 0, noPeers: false, deduped: true };
     const peers = this.peers.active(10);
     if (!peers.length) return { accepted: 0, total: 0, noPeers: true };
-    let accepted = 0;
-    for (const peer of peers) {
-      try {
-        const res = await fetchJSON(`${peer.url}/api/node/broadcast/block`, {
-          method: 'POST', body: { block }, timeout: 10,
-        });
-        if (res && res.ok) accepted++;
-      } catch {}
-    }
+    const results = await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/block`, {
+      method: 'POST', body: { block }, timeout: 10,
+    })));
+    const accepted = results.filter(r => r.status === 'fulfilled' && r.value && r.value.ok).length;
     return { accepted, total: peers.length, noPeers: false };
   }
 
   async broadcastTx(tx) {
+    const key = `tx:${tx && tx.hash ? tx.hash : hashTransaction(tx)}`;
+    if (!this._rememberBroadcast(key)) return { deduped: true };
     const peers = this.peers.active(10);
-    for (const peer of peers) {
-      try {
-        await fetchJSON(`${peer.url}/api/node/broadcast/tx`, {
-          method: 'POST', body: { tx }, timeout: 5,
-        });
-      } catch {}
-    }
+    await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/tx`, {
+      method: 'POST', body: { tx }, timeout: 5,
+    })));
   }
 
   getStatus() {
