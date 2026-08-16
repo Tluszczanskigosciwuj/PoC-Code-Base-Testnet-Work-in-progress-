@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test tests/",
+    "test": "node --test \"tests/**/*.test.js\"",
     "cli": "node cli.js",
     "wallet": "node wallet.js",
     "wallet-py": "python wallet.py",
@@ -15,12 +15,20 @@
     "testnet": "node testnet/alpha-testnet.js"
   },
   "dependencies": {
+    "@ethereumjs/block": "^5.1.0",
+    "@ethereumjs/common": "^4.1.0",
+    "@ethereumjs/evm": "^10.1.2",
+    "@ethereumjs/statemanager": "^2.1.0",
+    "@ethereumjs/tx": "^5.1.0",
+    "@ethereumjs/util": "^9.1.0",
+    "@ethereumjs/vm": "^10.1.2",
     "better-sqlite3": "^11.7.0",
-    "ethereumjs-abi": "^0.6.8",
-    "ethereumjs-vm": "^4.2.0",
+    "bn.js": "^5.2.5",
+    "ethers": "^6.13.0",
     "express": "^5.2.1",
     "helmet": "^8.2.0",
     "localtunnel": "^2.0.2",
+    "noble-ed25519": "^1.2.6",
     "solc": "^0.8.28",
     "ws": "^8.21.0"
   }
