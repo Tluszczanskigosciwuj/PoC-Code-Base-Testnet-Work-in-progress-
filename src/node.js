@@ -13,7 +13,6 @@ const { SyncEngine } = require('./P2P/sync');
 const { Miner } = require('./miner');
 const { Server } = require('./server');
 const { P2PWebSocketServer } = require('./P2P/p2p-ws');
-// const { DiscoveryServer, connectDiscoveryServer } = require('./discovery'); // Removed: consolidated to HTTP-based discovery
 const { setupOptionalModules, loadOptionalModules } = require('./optional');
 
 class NodeRegistry {
@@ -126,7 +125,6 @@ class ChocoNode {
       if (cfg.miningEnabled && cfg.minerAddress) {
         setTimeout(() => this.miner.start(cfg.minerAddress), 3000);
       }
-      // Removed WebSocket discovery client - using HTTP-based discovery in SyncEngine instead
     }, 2000);
 
     this._setupShutdown();
